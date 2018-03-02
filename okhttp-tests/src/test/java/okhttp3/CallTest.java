@@ -23,10 +23,8 @@ import java.net.CookieManager;
 import java.net.HttpCookie;
 import java.net.HttpURLConnection;
 import java.net.InetAddress;
-import java.net.InetSocketAddress;
 import java.net.ProtocolException;
 import java.net.Proxy;
-import java.net.ServerSocket;
 import java.net.SocketTimeoutException;
 import java.net.UnknownHostException;
 import java.net.UnknownServiceException;
@@ -34,7 +32,9 @@ import java.security.cert.Certificate;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Set;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.Callable;
 import java.util.concurrent.CountDownLatch;
@@ -45,9 +45,9 @@ import java.util.concurrent.SynchronousQueue;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.logging.Level;
 import java.util.logging.Logger;
-import javax.net.ServerSocketFactory;
-import javax.net.ssl.SSLContext;
+import java.util.logging.SimpleFormatter;
 import javax.net.ssl.SSLHandshakeException;
 import javax.net.ssl.SSLPeerUnverifiedException;
 import javax.net.ssl.SSLProtocolException;
@@ -56,7 +56,6 @@ import javax.net.ssl.SSLSocketFactory;
 import okhttp3.internal.DoubleInetAddressDns;
 import okhttp3.internal.RecordingOkAuthenticator;
 import okhttp3.internal.SingleInetAddressDns;
-import okhttp3.internal.SslContextBuilder;
 import okhttp3.internal.Util;
 import okhttp3.internal.Version;
 import okhttp3.internal.http.RecordingProxySelector;
@@ -66,6 +65,8 @@ import okhttp3.mockwebserver.MockResponse;
 import okhttp3.mockwebserver.MockWebServer;
 import okhttp3.mockwebserver.RecordedRequest;
 import okhttp3.mockwebserver.SocketPolicy;
+import okhttp3.mockwebserver.internal.tls.HeldCertificate;
+import okhttp3.mockwebserver.internal.tls.SslClient;
 import okio.Buffer;
 import okio.BufferedSink;
 import okio.BufferedSource;
@@ -80,26 +81,28 @@ import org.junit.rules.TestRule;
 import org.junit.rules.Timeout;
 
 import static java.net.CookiePolicy.ACCEPT_ORIGINAL_SERVER;
+import static okhttp3.TestUtil.awaitGarbageCollection;
 import static okhttp3.TestUtil.defaultClient;
+import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertNotSame;
 import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 
 public final class CallTest {
-  @Rule public final TestRule timeout = new Timeout(30_000);
+  @Rule public final TestRule timeout = new Timeout(30_000, TimeUnit.MILLISECONDS);
   @Rule public final MockWebServer server = new MockWebServer();
   @Rule public final MockWebServer server2 = new MockWebServer();
   @Rule public final InMemoryFileSystem fileSystem = new InMemoryFileSystem();
 
-  private SSLContext sslContext = SslContextBuilder.localhost();
+  private SslClient sslClient = SslClient.localhost();
   private OkHttpClient client = defaultClient();
   private RecordingCallback callback = new RecordingCallback();
   private TestLogHandler logHandler = new TestLogHandler();
   private Cache cache = new Cache(new File("/cache/"), Integer.MAX_VALUE, fileSystem);
-  private ServerSocket nullServer;
   private Logger logger = Logger.getLogger(OkHttpClient.class.getName());
 
   @Before public void setUp() throws Exception {
@@ -108,7 +111,6 @@ public final class CallTest {
 
   @After public void tearDown() throws Exception {
     cache.delete();
-    Util.closeQuietly(nullServer);
     logger.removeHandler(logHandler);
   }
 
@@ -182,11 +184,6 @@ public final class CallTest {
     get();
   }
 
-  @Test public void get_SPDY_3() throws Exception {
-    enableProtocol(Protocol.SPDY_3);
-    get();
-  }
-
   @Test public void repeatedHeaderNames() throws Exception {
     server.enqueue(new MockResponse()
         .addHeader("B", "123")
@@ -198,11 +195,6 @@ public final class CallTest {
 
     RecordedRequest recordedRequest = server.takeRequest();
     assertEquals(Arrays.asList("345", "456"), recordedRequest.getHeaders().values("A"));
-  }
-
-  @Test public void repeatedHeaderNames_SPDY_3() throws Exception {
-    enableProtocol(Protocol.SPDY_3);
-    repeatedHeaderNames();
   }
 
   @Test public void repeatedHeaderNames_HTTP_2() throws Exception {
@@ -240,6 +232,59 @@ public final class CallTest {
     assertNull(recordedRequest.getHeader("Content-Length"));
   }
 
+  @Test public void headResponseContentLengthIsIgnored() throws Exception {
+    server.enqueue(new MockResponse()
+        .clearHeaders()
+        .addHeader("Content-Length", "100"));
+    server.enqueue(new MockResponse()
+        .setBody("abc"));
+
+    Request headRequest = new Request.Builder()
+        .url(server.url("/"))
+        .head()
+        .build();
+    Response response = client.newCall(headRequest).execute();
+    assertEquals(200, response.code());
+    assertArrayEquals(new byte[0], response.body().bytes());
+
+    Request getRequest = new Request.Builder()
+        .url(server.url("/"))
+        .build();
+    executeSynchronously(getRequest)
+        .assertCode(200)
+        .assertBody("abc");
+
+    assertEquals(0, server.takeRequest().getSequenceNumber());
+    assertEquals(1, server.takeRequest().getSequenceNumber());
+  }
+
+  @Test public void headResponseContentEncodingIsIgnored() throws Exception {
+    server.enqueue(new MockResponse()
+        .clearHeaders()
+        .addHeader("Content-Encoding", "chunked"));
+    server.enqueue(new MockResponse()
+        .setBody("abc"));
+
+    Request headRequest = new Request.Builder()
+        .url(server.url("/"))
+        .head()
+        .build();
+    executeSynchronously(headRequest)
+        .assertCode(200)
+        .assertHeader("Content-Encoding", "chunked")
+        .assertBody("");
+
+    Request getRequest = new Request.Builder()
+        .url(server.url("/"))
+        .build();
+    executeSynchronously(getRequest)
+        .assertCode(200)
+        .assertBody("abc");
+
+    assertEquals(0, server.takeRequest().getSequenceNumber());
+    assertEquals(1, server.takeRequest().getSequenceNumber());
+  }
+
   @Test public void head_HTTPS() throws Exception {
     enableTls();
     head();
@@ -247,11 +292,6 @@ public final class CallTest {
 
   @Test public void head_HTTP_2() throws Exception {
     enableProtocol(Protocol.HTTP_2);
-    head();
-  }
-
-  @Test public void head_SPDY_3() throws Exception {
-    enableProtocol(Protocol.SPDY_3);
     head();
   }
 
@@ -284,11 +324,6 @@ public final class CallTest {
     post();
   }
 
-  @Test public void post_SPDY_3() throws Exception {
-    enableProtocol(Protocol.SPDY_3);
-    post();
-  }
-
   @Test public void postZeroLength() throws Exception {
     server.enqueue(new MockResponse().setBody("abc"));
 
@@ -318,11 +353,6 @@ public final class CallTest {
     postZeroLength();
   }
 
-  @Test public void postZeroLength_SPDY_3() throws Exception {
-    enableProtocol(Protocol.SPDY_3);
-    postZeroLength();
-  }
-
   @Test public void postBodyRetransmittedAfterAuthorizationFail() throws Exception {
     postBodyRetransmittedAfterAuthorizationFail("abc");
   }
@@ -334,11 +364,6 @@ public final class CallTest {
 
   @Test public void postBodyRetransmittedAfterAuthorizationFail_HTTP_2() throws Exception {
     enableProtocol(Protocol.HTTP_2);
-    postBodyRetransmittedAfterAuthorizationFail("abc");
-  }
-
-  @Test public void postBodyRetransmittedAfterAuthorizationFail_SPDY_3() throws Exception {
-    enableProtocol(Protocol.SPDY_3);
     postBodyRetransmittedAfterAuthorizationFail("abc");
   }
 
@@ -354,11 +379,6 @@ public final class CallTest {
 
   @Test public void postEmptyBodyRetransmittedAfterAuthorizationFail_HTTP_2() throws Exception {
     enableProtocol(Protocol.HTTP_2);
-    postBodyRetransmittedAfterAuthorizationFail("");
-  }
-
-  @Test public void postEmptyBodyRetransmittedAfterAuthorizationFail_SPDY_3() throws Exception {
-    enableProtocol(Protocol.SPDY_3);
     postBodyRetransmittedAfterAuthorizationFail("");
   }
 
@@ -378,6 +398,7 @@ public final class CallTest {
 
     Response response = client.newCall(request).execute();
     assertEquals(200, response.code());
+    response.body().close();
 
     RecordedRequest recordedRequest1 = server.takeRequest();
     assertEquals("POST", recordedRequest1.getMethod());
@@ -424,6 +445,28 @@ public final class CallTest {
     }
   }
 
+  /**
+   * We had a bug where we were passing a null route to the authenticator.
+   * https://github.com/square/okhttp/issues/3809
+   */
+  @Test public void authenticateWithNoConnection() throws Exception {
+    server.enqueue(new MockResponse()
+        .addHeader("Connection: close")
+        .setResponseCode(401)
+        .setSocketPolicy(SocketPolicy.DISCONNECT_AT_END));
+
+    RecordingOkAuthenticator authenticator = new RecordingOkAuthenticator(null);
+
+    client = client.newBuilder()
+        .authenticator(authenticator)
+        .build();
+
+    executeSynchronously("/")
+        .assertCode(401);
+
+    assertNotNull(authenticator.onlyRoute());
+  }
+
   @Test public void delete() throws Exception {
     server.enqueue(new MockResponse().setBody("abc"));
 
@@ -450,11 +493,6 @@ public final class CallTest {
 
   @Test public void delete_HTTP_2() throws Exception {
     enableProtocol(Protocol.HTTP_2);
-    delete();
-  }
-
-  @Test public void delete_SPDY_3() throws Exception {
-    enableProtocol(Protocol.SPDY_3);
     delete();
   }
 
@@ -504,11 +542,6 @@ public final class CallTest {
     put();
   }
 
-  @Test public void put_SPDY_3() throws Exception {
-    enableProtocol(Protocol.SPDY_3);
-    put();
-  }
-
   @Test public void patch() throws Exception {
     server.enqueue(new MockResponse().setBody("abc"));
 
@@ -538,9 +571,23 @@ public final class CallTest {
     patch();
   }
 
-  @Test public void patch_SPDY_3() throws Exception {
-    enableProtocol(Protocol.SPDY_3);
-    patch();
+  @Test public void customMethodWithBody() throws Exception {
+    server.enqueue(new MockResponse().setBody("abc"));
+
+    Request request = new Request.Builder()
+        .url(server.url("/"))
+        .method("CUSTOM", RequestBody.create(MediaType.parse("text/plain"), "def"))
+        .build();
+
+    executeSynchronously(request)
+        .assertCode(200)
+        .assertBody("abc");
+
+    RecordedRequest recordedRequest = server.takeRequest();
+    assertEquals("CUSTOM", recordedRequest.getMethod());
+    assertEquals("def", recordedRequest.getBody().readUtf8());
+    assertEquals("3", recordedRequest.getHeader("Content-Length"));
+    assertEquals("text/plain; charset=utf-8", recordedRequest.getHeader("Content-Type"));
   }
 
   @Test public void unspecifiedRequestBodyContentTypeDoesNotGetDefault() throws Exception {
@@ -618,6 +665,49 @@ public final class CallTest {
     }
 
     assertEquals("SyncApiTest", server.takeRequest().getHeader("User-Agent"));
+  }
+
+  @Test public void legalToExecuteTwiceCloning() throws Exception {
+    server.enqueue(new MockResponse().setBody("abc"));
+    server.enqueue(new MockResponse().setBody("def"));
+
+    Request request = new Request.Builder()
+        .url(server.url("/"))
+        .build();
+
+    Call call = client.newCall(request);
+    Response response1 = call.execute();
+
+    Call cloned = call.clone();
+    Response response2 = cloned.execute();
+
+    assertEquals(response1.body().string(), "abc");
+    assertEquals(response2.body().string(), "def");
+  }
+
+  @Test public void legalToExecuteTwiceCloning_Async() throws Exception {
+    server.enqueue(new MockResponse().setBody("abc"));
+    server.enqueue(new MockResponse().setBody("def"));
+
+    Request request = new Request.Builder()
+        .url(server.url("/"))
+        .build();
+
+    Call call = client.newCall(request);
+    call.enqueue(callback);
+
+    Call cloned = call.clone();
+    cloned.enqueue(callback);
+
+    RecordedResponse firstResponse = callback.await(request.url()).assertSuccessful();
+    RecordedResponse secondResponse = callback.await(request.url()).assertSuccessful();
+
+    Set<String> bodies = new LinkedHashSet<>();
+    bodies.add(firstResponse.getBody());
+    bodies.add(secondResponse.getBody());
+
+    assertTrue(bodies.contains("abc"));
+    assertTrue(bodies.contains("def"));
   }
 
   @Test public void get_Async() throws Exception {
@@ -779,10 +869,8 @@ public final class CallTest {
    * special address that never connects. The automatic retry will succeed.
    */
   @Test public void connectTimeoutsAttemptsAlternateRoute() throws Exception {
-    InetSocketAddress unreachableAddress = new InetSocketAddress("10.255.255.1", 8080);
-
     RecordingProxySelector proxySelector = new RecordingProxySelector();
-    proxySelector.proxies.add(new Proxy(Proxy.Type.HTTP, unreachableAddress));
+    proxySelector.proxies.add(new Proxy(Proxy.Type.HTTP, TestUtil.UNREACHABLE_ADDRESS));
     proxySelector.proxies.add(server.toProxyAddress());
 
     server.enqueue(new MockResponse()
@@ -805,14 +893,14 @@ public final class CallTest {
    * never responds. The manual retry will succeed.
    */
   @Test public void readTimeoutFails() throws Exception {
-    InetSocketAddress nullServerAddress = startNullServer();
+    server.enqueue(new MockResponse()
+        .setSocketPolicy(SocketPolicy.STALL_SOCKET_AT_START));
+    server2.enqueue(new MockResponse()
+        .setBody("success!"));
 
     RecordingProxySelector proxySelector = new RecordingProxySelector();
-    proxySelector.proxies.add(new Proxy(Proxy.Type.HTTP, nullServerAddress));
     proxySelector.proxies.add(server.toProxyAddress());
-
-    server.enqueue(new MockResponse()
-        .setBody("success!"));
+    proxySelector.proxies.add(server2.toProxyAddress());
 
     client = client.newBuilder()
         .proxySelector(proxySelector)
@@ -829,7 +917,7 @@ public final class CallTest {
 
   /** https://github.com/square/okhttp/issues/1801 */
   @Test public void asyncCallEngineInitialized() throws Exception {
-    OkHttpClient c = new OkHttpClient.Builder()
+    OkHttpClient c = defaultClient().newBuilder()
         .addInterceptor(new Interceptor() {
           @Override public Response intercept(Chain chain) throws IOException {
             throw new IOException();
@@ -947,6 +1035,11 @@ public final class CallTest {
     executeSynchronously("/").assertBody("retry success");
   }
 
+  @Test public void recoverWhenRetryOnConnectionFailureIsTrue_HTTP2() throws Exception {
+    enableProtocol(Protocol.HTTP_2);
+    recoverWhenRetryOnConnectionFailureIsTrue();
+  }
+
   @Test public void noRecoverWhenRetryOnConnectionFailureIsFalse() throws Exception {
     server.enqueue(new MockResponse().setBody("seed connection pool"));
     server.enqueue(new MockResponse().setSocketPolicy(SocketPolicy.DISCONNECT_AFTER_REQUEST));
@@ -960,18 +1053,41 @@ public final class CallTest {
     executeSynchronously("/").assertBody("seed connection pool");
 
     // If this succeeds, too many requests were made.
-    executeSynchronously("/").assertFailure(IOException.class);
+    executeSynchronously("/")
+        .assertFailure(IOException.class)
+        .assertFailureMatches("stream was reset: CANCEL",
+            "unexpected end of stream on Connection.*"
+                + server.getHostName() + ":" + server.getPort() + ".*");
+  }
+
+  @Test public void recoverWhenRetryOnConnectionFailureIsFalse_HTTP2() throws Exception {
+    enableProtocol(Protocol.HTTP_2);
+    noRecoverWhenRetryOnConnectionFailureIsFalse();
+  }
+
+  @Test public void tlsHandshakeFailure_noFallbackByDefault() throws Exception {
+    server.useHttps(sslClient.socketFactory, false);
+    server.enqueue(new MockResponse().setSocketPolicy(SocketPolicy.FAIL_HANDSHAKE));
+    server.enqueue(new MockResponse().setBody("response that will never be received"));
+    RecordedResponse response = executeSynchronously("/");
+    response.assertFailure(
+            SSLProtocolException.class, // RI response to the FAIL_HANDSHAKE
+            SSLHandshakeException.class // Android's response to the FAIL_HANDSHAKE
+    );
+    assertFalse(client.connectionSpecs().contains(ConnectionSpec.COMPATIBLE_TLS));
   }
 
   @Test public void recoverFromTlsHandshakeFailure() throws Exception {
-    server.useHttps(sslContext.getSocketFactory(), false);
+    server.useHttps(sslClient.socketFactory, false);
     server.enqueue(new MockResponse().setSocketPolicy(SocketPolicy.FAIL_HANDSHAKE));
     server.enqueue(new MockResponse().setBody("abc"));
 
     client = client.newBuilder()
         .hostnameVerifier(new RecordingHostnameVerifier())
         .dns(new SingleInetAddressDns())
-        .sslSocketFactory(suppressTlsFallbackClientSocketFactory())
+        // opt-in to fallback to COMPATIBLE_TLS
+        .connectionSpecs(Arrays.asList(ConnectionSpec.MODERN_TLS, ConnectionSpec.COMPATIBLE_TLS))
+        .sslSocketFactory(suppressTlsFallbackClientSocketFactory(), sslClient.trustManager)
         .build();
 
     executeSynchronously("/").assertBody("abc");
@@ -980,19 +1096,21 @@ public final class CallTest {
   @Test public void recoverFromTlsHandshakeFailure_tlsFallbackScsvEnabled() throws Exception {
     final String tlsFallbackScsv = "TLS_FALLBACK_SCSV";
     List<String> supportedCiphers =
-        Arrays.asList(sslContext.getSocketFactory().getSupportedCipherSuites());
+        Arrays.asList(sslClient.socketFactory.getSupportedCipherSuites());
     if (!supportedCiphers.contains(tlsFallbackScsv)) {
       // This only works if the client socket supports TLS_FALLBACK_SCSV.
       return;
     }
 
-    server.useHttps(sslContext.getSocketFactory(), false);
+    server.useHttps(sslClient.socketFactory, false);
     server.enqueue(new MockResponse().setSocketPolicy(SocketPolicy.FAIL_HANDSHAKE));
 
     RecordingSSLSocketFactory clientSocketFactory =
-        new RecordingSSLSocketFactory(sslContext.getSocketFactory());
+        new RecordingSSLSocketFactory(sslClient.socketFactory);
     client = client.newBuilder()
-        .sslSocketFactory(clientSocketFactory)
+        .sslSocketFactory(clientSocketFactory, sslClient.trustManager)
+        // opt-in to fallback to COMPATIBLE_TLS
+        .connectionSpecs(Arrays.asList(ConnectionSpec.MODERN_TLS, ConnectionSpec.COMPATIBLE_TLS))
         .hostnameVerifier(new RecordingHostnameVerifier())
         .dns(new SingleInetAddressDns())
         .build();
@@ -1012,13 +1130,14 @@ public final class CallTest {
   }
 
   @Test public void recoverFromTlsHandshakeFailure_Async() throws Exception {
-    server.useHttps(sslContext.getSocketFactory(), false);
+    server.useHttps(sslClient.socketFactory, false);
     server.enqueue(new MockResponse().setSocketPolicy(SocketPolicy.FAIL_HANDSHAKE));
     server.enqueue(new MockResponse().setBody("abc"));
 
     client = client.newBuilder()
         .hostnameVerifier(new RecordingHostnameVerifier())
-        .sslSocketFactory(suppressTlsFallbackClientSocketFactory())
+        .connectionSpecs(Arrays.asList(ConnectionSpec.MODERN_TLS, ConnectionSpec.COMPATIBLE_TLS))
+        .sslSocketFactory(suppressTlsFallbackClientSocketFactory(), sslClient.trustManager)
         .build();
 
     Request request = new Request.Builder()
@@ -1034,10 +1153,10 @@ public final class CallTest {
         .connectionSpecs(Arrays.asList(ConnectionSpec.MODERN_TLS, ConnectionSpec.CLEARTEXT))
         .hostnameVerifier(new RecordingHostnameVerifier())
         .dns(new SingleInetAddressDns())
-        .sslSocketFactory(suppressTlsFallbackClientSocketFactory())
+        .sslSocketFactory(suppressTlsFallbackClientSocketFactory(), sslClient.trustManager)
         .build();
 
-    server.useHttps(sslContext.getSocketFactory(), false);
+    server.useHttps(sslClient.socketFactory, false);
     server.enqueue(new MockResponse().setSocketPolicy(SocketPolicy.FAIL_HANDSHAKE));
 
     Request request = new Request.Builder().url(server.url("/")).build();
@@ -1064,7 +1183,7 @@ public final class CallTest {
       client.newCall(request).execute();
       fail();
     } catch (UnknownServiceException expected) {
-      assertTrue(expected.getMessage().contains("CLEARTEXT communication not supported"));
+      assertEquals("CLEARTEXT communication not enabled for client", expected.getMessage());
     }
   }
 
@@ -1177,6 +1296,11 @@ public final class CallTest {
     assertEquals(0, post2.getSequenceNumber());
   }
 
+  @Test public void postBodyRetransmittedOnFailureRecovery_HTTP2() throws Exception {
+    enableProtocol(Protocol.HTTP_2);
+    postBodyRetransmittedOnFailureRecovery();
+  }
+
   @Test public void cacheHit() throws Exception {
     server.enqueue(new MockResponse()
         .addHeader("ETag: v1")
@@ -1251,7 +1375,7 @@ public final class CallTest {
         .build();
 
     // Store a response in the cache.
-    long request1At = System.currentTimeMillis();
+    long request1SentAt = System.currentTimeMillis();
     executeSynchronously("/", "Accept-Language", "fr-CA", "Accept-Charset", "UTF-8")
         .assertCode(200)
         .assertHeader("Donut", "a")
@@ -1275,8 +1399,8 @@ public final class CallTest {
         .assertRequestHeader("Accept-Language", "en-US")
         .assertRequestHeader("Accept-Charset", "UTF-8")
         .assertRequestHeader("If-None-Match") // No If-None-Match on the user's request.
-        .assertSentRequestAtMillis(request1At, request1ReceivedAt)
-        .assertReceivedResponseAtMillis(request1At, request1ReceivedAt);
+        .assertSentRequestAtMillis(request2SentAt, request2ReceivedAt)
+        .assertReceivedResponseAtMillis(request2SentAt, request2ReceivedAt);
 
     // Check the cached response. Its request contains only the saved Vary headers.
     cacheHit.cacheResponse()
@@ -1287,8 +1411,8 @@ public final class CallTest {
         .assertRequestHeader("Accept-Language") // No Vary on Accept-Language.
         .assertRequestHeader("Accept-Charset", "UTF-8") // Because of Vary on Accept-Charset.
         .assertRequestHeader("If-None-Match") // This wasn't present in the original request.
-        .assertSentRequestAtMillis(request1At, request1ReceivedAt)
-        .assertReceivedResponseAtMillis(request1At, request1ReceivedAt);
+        .assertSentRequestAtMillis(request1SentAt, request1ReceivedAt)
+        .assertReceivedResponseAtMillis(request1SentAt, request1ReceivedAt);
 
     // Check the network response. It has the caller's request, plus some caching headers.
     cacheHit.networkResponse()
@@ -1429,7 +1553,7 @@ public final class CallTest {
     // Attempt conditional cache validation and a DNS miss.
     client.connectionPool().evictAll();
     client = client.newBuilder()
-        .dns(new FakeDns().unknownHost())
+        .dns(new FakeDns())
         .build();
     executeSynchronously("/").assertFailure(UnknownHostException.class);
   }
@@ -1484,30 +1608,50 @@ public final class CallTest {
   }
 
   @Test public void getClientRequestTimeout() throws Exception {
-    enqueueRequestTimeoutResponses();
+    server.enqueue(new MockResponse()
+        .setSocketPolicy(SocketPolicy.DISCONNECT_AT_END)
+        .setResponseCode(408)
+        .setHeader("Connection", "Close")
+        .setBody("You took too long!"));
+    server.enqueue(new MockResponse().setBody("Body"));
 
-    Response response = client.newCall(new Request.Builder()
-        .url(server.url("/")).build()).execute();
+    Request request = new Request.Builder()
+        .url(server.url("/"))
+        .build();
+    Response response = client.newCall(request).execute();
 
     assertEquals("Body", response.body().string());
   }
 
-  private void enqueueRequestTimeoutResponses() {
+  @Test public void getClientRequestTimeoutWithBackPressure() throws Exception {
     server.enqueue(new MockResponse()
         .setSocketPolicy(SocketPolicy.DISCONNECT_AT_END)
-        .setResponseCode(HttpURLConnection.HTTP_CLIENT_TIMEOUT)
+        .setResponseCode(408)
         .setHeader("Connection", "Close")
+        .setHeader("Retry-After", "1")
         .setBody("You took too long!"));
-    server.enqueue(new MockResponse().setBody("Body"));
+
+    Request request = new Request.Builder()
+        .url(server.url("/"))
+        .build();
+    Response response = client.newCall(request).execute();
+
+    assertEquals("You took too long!", response.body().string());
   }
 
   @Test public void requestBodyRetransmittedOnClientRequestTimeout() throws Exception {
-    enqueueRequestTimeoutResponses();
+    server.enqueue(new MockResponse()
+        .setSocketPolicy(SocketPolicy.DISCONNECT_AT_END)
+        .setResponseCode(408)
+        .setHeader("Connection", "Close")
+        .setBody("You took too long!"));
+    server.enqueue(new MockResponse().setBody("Body"));
 
-    Response response = client.newCall(new Request.Builder()
+    Request request = new Request.Builder()
         .url(server.url("/"))
         .post(RequestBody.create(MediaType.parse("text/plain"), "Hello"))
-        .build()).execute();
+        .build();
+    Response response = client.newCall(request).execute();
 
     assertEquals("Body", response.body().string());
 
@@ -1518,17 +1662,106 @@ public final class CallTest {
     assertEquals("Hello", request2.getBody().readUtf8());
   }
 
-  @Test public void propfindRedirectsToPropfind() throws Exception {
+  @Test public void disableClientRequestTimeoutRetry() throws IOException {
+    server.enqueue(new MockResponse()
+        .setSocketPolicy(SocketPolicy.DISCONNECT_AT_END)
+        .setResponseCode(408)
+        .setHeader("Connection", "Close")
+        .setBody("You took too long!"));
+
+    client = client.newBuilder()
+        .retryOnConnectionFailure(false)
+        .build();
+
+    Request request = new Request.Builder()
+        .url(server.url("/"))
+        .build();
+    Response response = client.newCall(request).execute();
+
+    assertEquals(408, response.code());
+    assertEquals("You took too long!", response.body().string());
+  }
+
+  @Test public void maxClientRequestTimeoutRetries() throws IOException {
+    server.enqueue(new MockResponse()
+        .setSocketPolicy(SocketPolicy.DISCONNECT_AT_END)
+        .setResponseCode(408)
+        .setHeader("Connection", "Close")
+        .setBody("You took too long!"));
+    server.enqueue(new MockResponse()
+        .setSocketPolicy(SocketPolicy.DISCONNECT_AT_END)
+        .setResponseCode(408)
+        .setHeader("Connection", "Close")
+        .setBody("You took too long!"));
+
+    Request request = new Request.Builder()
+        .url(server.url("/"))
+        .build();
+    Response response = client.newCall(request).execute();
+
+    assertEquals(408, response.code());
+    assertEquals("You took too long!", response.body().string());
+
+    assertEquals(2, server.getRequestCount());
+  }
+
+  @Test public void maxUnavailableTimeoutRetries() throws IOException {
+    server.enqueue(new MockResponse()
+        .setSocketPolicy(SocketPolicy.DISCONNECT_AT_END)
+        .setResponseCode(503)
+        .setHeader("Connection", "Close")
+        .setHeader("Retry-After", "0")
+        .setBody("You took too long!"));
+    server.enqueue(new MockResponse()
+        .setSocketPolicy(SocketPolicy.DISCONNECT_AT_END)
+        .setResponseCode(503)
+        .setHeader("Connection", "Close")
+        .setHeader("Retry-After", "0")
+        .setBody("You took too long!"));
+
+    Request request = new Request.Builder()
+        .url(server.url("/"))
+        .build();
+    Response response = client.newCall(request).execute();
+
+    assertEquals(503, response.code());
+    assertEquals("You took too long!", response.body().string());
+
+    assertEquals(2, server.getRequestCount());
+  }
+
+  @Test public void retryOnUnavailableWith0RetryAfter() throws IOException {
+    server.enqueue(new MockResponse()
+        .setSocketPolicy(SocketPolicy.DISCONNECT_AT_END)
+        .setResponseCode(503)
+        .setHeader("Connection", "Close")
+        .setHeader("Retry-After", "0")
+        .setBody("You took too long!"));
+    server.enqueue(new MockResponse().setBody("Body"));
+
+    Request request = new Request.Builder()
+        .url(server.url("/"))
+        .build();
+    Response response = client.newCall(request).execute();
+
+    assertEquals("Body", response.body().string());
+  }
+
+  @Test public void propfindRedirectsToPropfindAndMaintainsRequestBody() throws Exception {
+    // given
     server.enqueue(new MockResponse()
         .setResponseCode(HttpURLConnection.HTTP_MOVED_TEMP)
         .addHeader("Location: /page2")
         .setBody("This page has moved!"));
     server.enqueue(new MockResponse().setBody("Page 2"));
 
+    // when
     Response response = client.newCall(new Request.Builder()
         .url(server.url("/page1"))
         .method("PROPFIND", RequestBody.create(MediaType.parse("text/plain"), "Request Body"))
         .build()).execute();
+
+    // then
     assertEquals("Page 2", response.body().string());
 
     RecordedRequest page1 = server.takeRequest();
@@ -1537,6 +1770,7 @@ public final class CallTest {
 
     RecordedRequest page2 = server.takeRequest();
     assertEquals("PROPFIND /page2 HTTP/1.1", page2.getRequestLine());
+    assertEquals("Request Body", page2.getBody().readUtf8());
   }
 
   @Test public void responseCookies() throws Exception {
@@ -1735,6 +1969,25 @@ public final class CallTest {
         .assertFailure("HTTP 205 had non-zero Content-Length: 39");
   }
 
+  @Test public void httpWithExcessiveHeaders() throws IOException {
+    String longLine = "HTTP/1.1 200 " + stringFill('O', 256 * 1024) + "K";
+
+    server.setProtocols(Collections.singletonList(Protocol.HTTP_1_1));
+
+    server.enqueue(new MockResponse()
+        .setStatus(longLine)
+        .setBody("I'm not even supposed to be here today."));
+
+    executeSynchronously("/")
+        .assertFailureMatches(".*unexpected end of stream on Connection.*");
+  }
+
+  private String stringFill(char fillChar, int length) {
+    char[] value = new char[length];
+    Arrays.fill(value, fillChar);
+    return new String(value);
+  }
+
   @Test public void canceledBeforeExecute() throws Exception {
     Call call = client.newCall(new Request.Builder().url(server.url("/a")).build());
     call.cancel();
@@ -1757,16 +2010,13 @@ public final class CallTest {
 
   /** Cancel a call that's waiting for connect to complete. */
   private void cancelDuringConnect(String scheme) throws Exception {
-    InetSocketAddress socketAddress = startNullServer();
-
-    HttpUrl url = new HttpUrl.Builder()
-        .scheme(scheme)
-        .host(socketAddress.getHostName())
-        .port(socketAddress.getPort())
-        .build();
+    server.enqueue(new MockResponse()
+        .setSocketPolicy(SocketPolicy.STALL_SOCKET_AT_START));
 
     long cancelDelayMillis = 300L;
-    Call call = client.newCall(new Request.Builder().url(url).build());
+    Call call = client.newCall(new Request.Builder()
+        .url(server.url("/").newBuilder().scheme(scheme).build())
+        .build());
     cancelLater(call, cancelDelayMillis);
 
     long startNanos = System.nanoTime();
@@ -1779,13 +2029,6 @@ public final class CallTest {
     assertEquals(cancelDelayMillis, TimeUnit.NANOSECONDS.toMillis(elapsedNanos), 100f);
   }
 
-  private InetSocketAddress startNullServer() throws IOException {
-    InetSocketAddress address = new InetSocketAddress(InetAddress.getByName("localhost"), 0);
-    nullServer = ServerSocketFactory.getDefault().createServerSocket();
-    nullServer.bind(address);
-    return new InetSocketAddress(address.getAddress(), nullServer.getLocalPort());
-  }
-
   @Test public void cancelImmediatelyAfterEnqueue() throws Exception {
     server.enqueue(new MockResponse());
     Call call = client.newCall(new Request.Builder()
@@ -1793,7 +2036,7 @@ public final class CallTest {
         .build());
     call.enqueue(callback);
     call.cancel();
-    callback.await(server.url("/a")).assertFailure("Canceled");
+    callback.await(server.url("/a")).assertFailure("Canceled", "Socket closed");
   }
 
   @Test public void cancelAll() throws Exception {
@@ -1802,7 +2045,7 @@ public final class CallTest {
         .build());
     call.enqueue(callback);
     client.dispatcher().cancelAll();
-    callback.await(server.url("/")).assertFailure("Canceled");
+    callback.await(server.url("/")).assertFailure("Canceled", "Socket closed");
   }
 
   @Test public void cancelBeforeBodyIsRead() throws Exception {
@@ -1855,17 +2098,17 @@ public final class CallTest {
     cancelInFlightBeforeResponseReadThrowsIOE();
   }
 
-  @Test public void cancelInFlightBeforeResponseReadThrowsIOE_SPDY_3() throws Exception {
-    enableProtocol(Protocol.SPDY_3);
-    cancelInFlightBeforeResponseReadThrowsIOE();
-  }
-
   /**
    * This test puts a request in front of one that is to be canceled, so that it is canceled before
    * I/O takes place.
    */
   @Test public void canceledBeforeIOSignalsOnFailure() throws Exception {
-    client.dispatcher().setMaxRequests(1); // Force requests to be executed serially.
+    // Force requests to be executed serially.
+    okhttp3.Dispatcher dispatcher = new okhttp3.Dispatcher(client.dispatcher().executorService());
+    dispatcher.setMaxRequests(1);
+    client = client.newBuilder()
+        .dispatcher(dispatcher)
+        .build();
 
     Request requestA = new Request.Builder().url(server.url("/a")).build();
     Request requestB = new Request.Builder().url(server.url("/b")).build();
@@ -1887,7 +2130,7 @@ public final class CallTest {
 
     callback.await(requestA.url()).assertBody("A");
     // At this point we know the callback is ready, and that it will receive a cancel failure.
-    callback.await(requestB.url()).assertFailure("Canceled");
+    callback.await(requestB.url()).assertFailure("Canceled", "Socket closed");
   }
 
   @Test public void canceledBeforeIOSignalsOnFailure_HTTPS() throws Exception {
@@ -1897,11 +2140,6 @@ public final class CallTest {
 
   @Test public void canceledBeforeIOSignalsOnFailure_HTTP_2() throws Exception {
     enableProtocol(Protocol.HTTP_2);
-    canceledBeforeIOSignalsOnFailure();
-  }
-
-  @Test public void canceledBeforeIOSignalsOnFailure_SPDY_3() throws Exception {
-    enableProtocol(Protocol.SPDY_3);
     canceledBeforeIOSignalsOnFailure();
   }
 
@@ -1929,11 +2167,6 @@ public final class CallTest {
 
   @Test public void canceledBeforeResponseReadSignalsOnFailure_HTTP_2() throws Exception {
     enableProtocol(Protocol.HTTP_2);
-    canceledBeforeResponseReadSignalsOnFailure();
-  }
-
-  @Test public void canceledBeforeResponseReadSignalsOnFailure_SPDY_3() throws Exception {
-    enableProtocol(Protocol.SPDY_3);
     canceledBeforeResponseReadSignalsOnFailure();
   }
 
@@ -1983,12 +2216,6 @@ public final class CallTest {
   @Test public void canceledAfterResponseIsDeliveredBreaksStreamButSignalsOnce_HTTP_2()
       throws Exception {
     enableProtocol(Protocol.HTTP_2);
-    canceledAfterResponseIsDeliveredBreaksStreamButSignalsOnce();
-  }
-
-  @Test public void canceledAfterResponseIsDeliveredBreaksStreamButSignalsOnce_SPDY_3()
-      throws Exception {
-    enableProtocol(Protocol.SPDY_3);
     canceledAfterResponseIsDeliveredBreaksStreamButSignalsOnce();
   }
 
@@ -2048,6 +2275,33 @@ public final class CallTest {
         .build();
 
     executeSynchronously("/").assertBody("abcabcabc");
+  }
+
+  @Test public void rangeHeaderPreventsAutomaticGzip() throws Exception {
+    Buffer gzippedBody = gzip("abcabcabc");
+
+    // Enqueue a gzipped response. Our request isn't expecting it, but that's okay.
+    server.enqueue(new MockResponse()
+        .setResponseCode(HttpURLConnection.HTTP_PARTIAL)
+        .setBody(gzippedBody)
+        .addHeader("Content-Encoding: gzip")
+        .addHeader("Content-Range: bytes 0-" + (gzippedBody.size() - 1)));
+
+    // Make a range request.
+    Request request = new Request.Builder()
+        .url(server.url("/"))
+        .header("Range", "bytes=0-")
+        .build();
+    Call call = client.newCall(request);
+
+    // The response is not decompressed.
+    Response response = call.execute();
+    assertEquals("gzip", response.header("Content-Encoding"));
+    assertEquals(gzippedBody.snapshot(), response.body().source().readByteString());
+
+    // The request did not offer gzip support.
+    RecordedRequest recordedRequest = server.takeRequest();
+    assertNull(recordedRequest.getHeader("Accept-Encoding"));
   }
 
   @Test public void asyncResponseCanBeConsumedLater() throws Exception {
@@ -2113,7 +2367,8 @@ public final class CallTest {
   }
 
   @Test public void expect100ContinueNonEmptyRequestBody() throws Exception {
-    server.enqueue(new MockResponse());
+    server.enqueue(new MockResponse()
+        .setSocketPolicy(SocketPolicy.EXPECT_CONTINUE));
 
     Request request = new Request.Builder()
         .url(server.url("/"))
@@ -2142,6 +2397,151 @@ public final class CallTest {
         .assertSuccessful();
   }
 
+  @Test public void expect100ContinueEmptyRequestBody_HTTP2() throws Exception {
+    enableProtocol(Protocol.HTTP_2);
+    expect100ContinueEmptyRequestBody();
+  }
+
+  @Test public void expect100ContinueTimesOutWithoutContinue() throws Exception {
+    server.enqueue(new MockResponse()
+        .setSocketPolicy(SocketPolicy.NO_RESPONSE));
+
+    client = client.newBuilder()
+        .readTimeout(500, TimeUnit.MILLISECONDS)
+        .build();
+
+    Request request = new Request.Builder()
+        .url(server.url("/"))
+        .header("Expect", "100-continue")
+        .post(RequestBody.create(MediaType.parse("text/plain"), "abc"))
+        .build();
+
+    Call call = client.newCall(request);
+    try {
+      call.execute();
+      fail();
+    } catch (SocketTimeoutException expected) {
+    }
+
+    RecordedRequest recordedRequest = server.takeRequest();
+    assertEquals("", recordedRequest.getBody().readUtf8());
+  }
+
+  @Test public void expect100ContinueTimesOutWithoutContinue_HTTP2() throws Exception {
+    enableProtocol(Protocol.HTTP_2);
+    expect100ContinueTimesOutWithoutContinue();
+  }
+
+  @Test public void serverRespondsWithUnsolicited100Continue() throws Exception {
+    server.enqueue(new MockResponse()
+        .setSocketPolicy(SocketPolicy.CONTINUE_ALWAYS));
+
+    Request request = new Request.Builder()
+        .url(server.url("/"))
+        .post(RequestBody.create(MediaType.parse("text/plain"), "abc"))
+        .build();
+
+    executeSynchronously(request)
+        .assertCode(200)
+        .assertSuccessful();
+
+    RecordedRequest recordedRequest = server.takeRequest();
+    assertEquals("abc", recordedRequest.getBody().readUtf8());
+  }
+
+  @Test public void serverRespondsWithUnsolicited100Continue_HTTP2() throws Exception {
+    enableProtocol(Protocol.HTTP_2);
+    serverRespondsWithUnsolicited100Continue();
+  }
+
+  @Test public void serverRespondsWith100ContinueOnly() throws Exception {
+    client = client.newBuilder()
+        .readTimeout(1, TimeUnit.SECONDS)
+        .build();
+
+    server.enqueue(new MockResponse()
+        .setStatus("HTTP/1.1 100 Continue"));
+
+    Request request = new Request.Builder()
+        .url(server.url("/"))
+        .post(RequestBody.create(MediaType.parse("text/plain"), "abc"))
+        .build();
+
+    Call call = client.newCall(request);
+    try {
+      call.execute();
+      fail();
+    } catch (SocketTimeoutException expected) {
+    }
+
+    RecordedRequest recordedRequest = server.takeRequest();
+    assertEquals("abc", recordedRequest.getBody().readUtf8());
+  }
+
+  @Test public void serverRespondsWith100ContinueOnly_HTTP2() throws Exception {
+    enableProtocol(Protocol.HTTP_2);
+    serverRespondsWith100ContinueOnly();
+  }
+
+  @Test public void successfulExpectContinuePermitsConnectionReuse() throws Exception {
+    server.enqueue(new MockResponse()
+        .setSocketPolicy(SocketPolicy.EXPECT_CONTINUE));
+    server.enqueue(new MockResponse());
+
+    executeSynchronously(new Request.Builder()
+        .url(server.url("/"))
+        .header("Expect", "100-continue")
+        .post(RequestBody.create(MediaType.parse("text/plain"), "abc"))
+        .build());
+    executeSynchronously(new Request.Builder()
+        .url(server.url("/"))
+        .build());
+
+    assertEquals(0, server.takeRequest().getSequenceNumber());
+    assertEquals(1, server.takeRequest().getSequenceNumber());
+  }
+
+  @Test public void successfulExpectContinuePermitsConnectionReuseWithHttp2() throws Exception {
+    enableProtocol(Protocol.HTTP_2);
+    successfulExpectContinuePermitsConnectionReuse();
+  }
+
+  @Test public void unsuccessfulExpectContinuePreventsConnectionReuse() throws Exception {
+    server.enqueue(new MockResponse());
+    server.enqueue(new MockResponse());
+
+    executeSynchronously(new Request.Builder()
+        .url(server.url("/"))
+        .header("Expect", "100-continue")
+        .post(RequestBody.create(MediaType.parse("text/plain"), "abc"))
+        .build());
+    executeSynchronously(new Request.Builder()
+        .url(server.url("/"))
+        .build());
+
+    assertEquals(0, server.takeRequest().getSequenceNumber());
+    assertEquals(0, server.takeRequest().getSequenceNumber());
+  }
+
+  @Test public void unsuccessfulExpectContinuePermitsConnectionReuseWithHttp2() throws Exception {
+    enableProtocol(Protocol.HTTP_2);
+
+    server.enqueue(new MockResponse());
+    server.enqueue(new MockResponse());
+
+    executeSynchronously(new Request.Builder()
+        .url(server.url("/"))
+        .header("Expect", "100-continue")
+        .post(RequestBody.create(MediaType.parse("text/plain"), "abc"))
+        .build());
+    executeSynchronously(new Request.Builder()
+        .url(server.url("/"))
+        .build());
+
+    assertEquals(0, server.takeRequest().getSequenceNumber());
+    assertEquals(1, server.takeRequest().getSequenceNumber());
+  }
+
   /** We forbid non-ASCII characters in outgoing request headers, but accept UTF-8. */
   @Test public void responseHeaderParsingIsLenient() throws Exception {
     Headers headers = new Headers.Builder()
@@ -2159,9 +2559,9 @@ public final class CallTest {
   }
 
   @Test public void customDns() throws Exception {
-    // Configure a DNS that returns our MockWebServer for every hostname.
+    // Configure a DNS that returns our local MockWebServer for android.com.
     FakeDns dns = new FakeDns();
-    dns.addresses(Dns.SYSTEM.lookup(server.url("/").host()));
+    dns.set("android.com", Dns.SYSTEM.lookup(server.url("/").host()));
     client = client.newBuilder()
         .dns(dns)
         .build();
@@ -2171,6 +2571,23 @@ public final class CallTest {
         .url(server.url("/").newBuilder().host("android.com").build())
         .build();
     executeSynchronously(request).assertCode(200);
+
+    dns.assertRequests("android.com");
+  }
+  @Test public void dnsReturnsZeroIpAddresses() throws Exception {
+    // Configure a DNS that returns our local MockWebServer for android.com.
+    FakeDns dns = new FakeDns();
+    List<InetAddress> ipAddresses = new ArrayList<>();
+    dns.set("android.com", ipAddresses);
+    client = client.newBuilder()
+        .dns(dns)
+        .build();
+
+    server.enqueue(new MockResponse());
+    Request request = new Request.Builder()
+        .url(server.url("/").newBuilder().host("android.com").build())
+        .build();
+    executeSynchronously(request).assertFailure(dns + " returned no addresses for android.com");
 
     dns.assertRequests("android.com");
   }
@@ -2206,7 +2623,7 @@ public final class CallTest {
 
   /** Test which headers are sent unencrypted to the HTTP proxy. */
   @Test public void proxyConnectOmitsApplicationHeaders() throws Exception {
-    server.useHttps(sslContext.getSocketFactory(), true);
+    server.useHttps(sslClient.socketFactory, true);
     server.enqueue(new MockResponse()
         .setSocketPolicy(SocketPolicy.UPGRADE_TO_SSL_AT_END)
         .clearHeaders());
@@ -2215,7 +2632,7 @@ public final class CallTest {
 
     RecordingHostnameVerifier hostnameVerifier = new RecordingHostnameVerifier();
     client = client.newBuilder()
-        .sslSocketFactory(sslContext.getSocketFactory())
+        .sslSocketFactory(sslClient.socketFactory, sslClient.trustManager)
         .proxy(server.toProxyAddress())
         .hostnameVerifier(hostnameVerifier)
         .build();
@@ -2243,7 +2660,7 @@ public final class CallTest {
 
   /** Respond to a proxy authorization challenge. */
   @Test public void proxyAuthenticateOnConnect() throws Exception {
-    server.useHttps(sslContext.getSocketFactory(), true);
+    server.useHttps(sslClient.socketFactory, true);
     server.enqueue(new MockResponse()
         .setResponseCode(407)
         .addHeader("Proxy-Authenticate: Basic realm=\"localhost\""));
@@ -2254,7 +2671,7 @@ public final class CallTest {
         .setBody("response body"));
 
     client = client.newBuilder()
-        .sslSocketFactory(sslContext.getSocketFactory())
+        .sslSocketFactory(sslClient.socketFactory, sslClient.trustManager)
         .proxy(server.toProxyAddress())
         .proxyAuthenticator(new RecordingOkAuthenticator("password"))
         .hostnameVerifier(new RecordingHostnameVerifier())
@@ -2308,11 +2725,11 @@ public final class CallTest {
   }
 
   /**
-   * OkHttp has a bug where a `Connection: close` response header is not honored when establishing
-   * a TLS tunnel. https://github.com/square/okhttp/issues/2426
+   * OkHttp has a bug where a `Connection: close` response header is not honored when establishing a
+   * TLS tunnel. https://github.com/square/okhttp/issues/2426
    */
   @Test public void proxyAuthenticateOnConnectWithConnectionClose() throws Exception {
-    server.useHttps(sslContext.getSocketFactory(), true);
+    server.useHttps(sslClient.socketFactory, true);
     server.setProtocols(Collections.singletonList(Protocol.HTTP_1_1));
     server.enqueue(new MockResponse()
         .setResponseCode(407)
@@ -2325,7 +2742,7 @@ public final class CallTest {
         .setBody("response body"));
 
     client = client.newBuilder()
-        .sslSocketFactory(sslContext.getSocketFactory())
+        .sslSocketFactory(sslClient.socketFactory, sslClient.trustManager)
         .proxy(server.toProxyAddress())
         .proxyAuthenticator(new RecordingOkAuthenticator("password"))
         .hostnameVerifier(new RecordingHostnameVerifier())
@@ -2348,7 +2765,7 @@ public final class CallTest {
   }
 
   @Test public void tooManyProxyAuthFailuresWithConnectionClose() throws IOException {
-    server.useHttps(sslContext.getSocketFactory(), true);
+    server.useHttps(sslClient.socketFactory, true);
     server.setProtocols(Collections.singletonList(Protocol.HTTP_1_1));
     for (int i = 0; i < 21; i++) {
       server.enqueue(new MockResponse()
@@ -2358,7 +2775,7 @@ public final class CallTest {
     }
 
     client = client.newBuilder()
-        .sslSocketFactory(sslContext.getSocketFactory())
+        .sslSocketFactory(sslClient.socketFactory, sslClient.trustManager)
         .proxy(server.toProxyAddress())
         .proxyAuthenticator(new RecordingOkAuthenticator("password"))
         .hostnameVerifier(new RecordingHostnameVerifier())
@@ -2380,7 +2797,7 @@ public final class CallTest {
    * credentials. Worse, that approach leaks proxy credentials to the origin server.
    */
   @Test public void noProactiveProxyAuthorization() throws Exception {
-    server.useHttps(sslContext.getSocketFactory(), true);
+    server.useHttps(sslClient.socketFactory, true);
     server.enqueue(new MockResponse()
         .setSocketPolicy(SocketPolicy.UPGRADE_TO_SSL_AT_END)
         .clearHeaders());
@@ -2388,7 +2805,7 @@ public final class CallTest {
         .setBody("response body"));
 
     client = client.newBuilder()
-        .sslSocketFactory(sslContext.getSocketFactory())
+        .sslSocketFactory(sslClient.socketFactory, sslClient.trustManager)
         .proxy(server.toProxyAddress())
         .hostnameVerifier(new RecordingHostnameVerifier())
         .build();
@@ -2407,7 +2824,7 @@ public final class CallTest {
     assertEquals("password", get.getHeader("Proxy-Authorization"));
   }
 
-  @Test public void interceptorGetsFramedProtocol() throws Exception {
+  @Test public void interceptorGetsHttp2() throws Exception {
     enableProtocol(Protocol.HTTP_2);
 
     // Capture the protocol as it is observed by the interceptor.
@@ -2460,6 +2877,46 @@ public final class CallTest {
         .assertFailure("Unexpected status line:  HTTP/1.1 200 OK");
   }
 
+  @Test public void requestHeaderNameWithSpaceForbidden() throws Exception {
+    try {
+      new Request.Builder().addHeader("a b", "c");
+      fail();
+    } catch (IllegalArgumentException expected) {
+      assertEquals("Unexpected char 0x20 at 1 in header name: a b", expected.getMessage());
+    }
+  }
+
+  @Test public void requestHeaderNameWithTabForbidden() throws Exception {
+    try {
+      new Request.Builder().addHeader("a\tb", "c");
+      fail();
+    } catch (IllegalArgumentException expected) {
+      assertEquals("Unexpected char 0x09 at 1 in header name: a\tb", expected.getMessage());
+    }
+  }
+
+  @Test public void responseHeaderNameWithSpacePermitted() throws Exception {
+    server.enqueue(new MockResponse()
+        .clearHeaders()
+        .addHeader("content-length: 0")
+        .addHeaderLenient("a b", "c"));
+
+    Call call = client.newCall(new Request.Builder().url(server.url("/")).build());
+    Response response = call.execute();
+    assertEquals("c", response.header("a b"));
+  }
+
+  @Test public void responseHeaderNameWithTabPermitted() throws Exception {
+    server.enqueue(new MockResponse()
+        .clearHeaders()
+        .addHeader("content-length: 0")
+        .addHeaderLenient("a\tb", "c"));
+
+    Call call = client.newCall(new Request.Builder().url(server.url("/")).build());
+    Response response = call.execute();
+    assertEquals("c", response.header("a\tb"));
+  }
+
   @Test public void connectFails() throws Exception {
     server.shutdown();
 
@@ -2473,7 +2930,8 @@ public final class CallTest {
     // Enable a misconfigured proxy selector to guarantee that the request is retried.
     client = client.newBuilder()
         .proxySelector(new FakeProxySelector()
-            .addProxy(server2.toProxyAddress()))
+            .addProxy(server2.toProxyAddress())
+            .addProxy(Proxy.NO_PROXY))
         .build();
     server2.shutdown();
 
@@ -2536,7 +2994,7 @@ public final class CallTest {
   /** https://github.com/square/okhttp/issues/2344 */
   @Test public void ipv6HostHasSquareBraces() throws Exception {
     // Use a proxy to fake IPv6 connectivity, even if localhost doesn't have IPv6.
-    server.useHttps(sslContext.getSocketFactory(), true);
+    server.useHttps(sslClient.socketFactory, true);
     server.setProtocols(Collections.singletonList(Protocol.HTTP_1_1));
     server.enqueue(new MockResponse()
         .setSocketPolicy(SocketPolicy.UPGRADE_TO_SSL_AT_END)
@@ -2545,7 +3003,7 @@ public final class CallTest {
         .setBody("response body"));
 
     client = client.newBuilder()
-        .sslSocketFactory(sslContext.getSocketFactory())
+        .sslSocketFactory(sslClient.socketFactory, sslClient.trustManager)
         .hostnameVerifier(new RecordingHostnameVerifier())
         .proxy(server.toProxyAddress())
         .build();
@@ -2593,6 +3051,115 @@ public final class CallTest {
         .assertCode(200)
         .assertHeader("abc", "def")
         .assertBody("");
+  }
+
+  @Test public void leakedResponseBodyLogsStackTrace() throws Exception {
+    server.enqueue(new MockResponse()
+        .setBody("This gets leaked."));
+
+    client = defaultClient().newBuilder()
+        .connectionPool(new ConnectionPool(0, 10, TimeUnit.MILLISECONDS))
+        .build();
+
+    Request request = new Request.Builder()
+        .url(server.url("/"))
+        .build();
+
+    Level original = logger.getLevel();
+    logger.setLevel(Level.FINE);
+    logHandler.setFormatter(new SimpleFormatter());
+    try {
+      client.newCall(request).execute(); // Ignore the response so it gets leaked then GC'd.
+      awaitGarbageCollection();
+
+      String message = logHandler.take();
+      assertTrue(message.contains("A connection to " + server.url("/") + " was leaked."
+          + " Did you forget to close a response body?"));
+      assertTrue(message.contains("okhttp3.RealCall.execute("));
+      assertTrue(message.contains("okhttp3.CallTest.leakedResponseBodyLogsStackTrace("));
+    } finally {
+      logger.setLevel(original);
+    }
+  }
+
+  @Test public void asyncLeakedResponseBodyLogsStackTrace() throws Exception {
+    server.enqueue(new MockResponse()
+        .setBody("This gets leaked."));
+
+    client = defaultClient().newBuilder()
+        .connectionPool(new ConnectionPool(0, 10, TimeUnit.MILLISECONDS))
+        .build();
+
+    Request request = new Request.Builder()
+        .url(server.url("/"))
+        .build();
+
+    Level original = logger.getLevel();
+    logger.setLevel(Level.FINE);
+    logHandler.setFormatter(new SimpleFormatter());
+    try {
+      final CountDownLatch latch = new CountDownLatch(1);
+      client.newCall(request).enqueue(new Callback() {
+        @Override public void onFailure(Call call, IOException e) {
+          fail();
+        }
+
+        @Override public void onResponse(Call call, Response response) throws IOException {
+          // Ignore the response so it gets leaked then GC'd.
+          latch.countDown();
+        }
+      });
+      latch.await();
+      // There's some flakiness when triggering a GC for objects in a separate thread. Adding a
+      // small delay appears to ensure the objects will get GC'd.
+      Thread.sleep(200);
+      awaitGarbageCollection();
+
+      String message = logHandler.take();
+      assertTrue(message.contains("A connection to " + server.url("/") + " was leaked."
+          + " Did you forget to close a response body?"));
+      assertTrue(message.contains("okhttp3.RealCall.enqueue("));
+      assertTrue(message.contains("okhttp3.CallTest.asyncLeakedResponseBodyLogsStackTrace("));
+    } finally {
+      logger.setLevel(original);
+    }
+  }
+
+  @Test public void httpsWithIpAddress() throws Exception {
+    String localIpAddress = InetAddress.getLoopbackAddress().getHostAddress();
+
+    // Create a certificate with an IP address in the subject alt name.
+    HeldCertificate heldCertificate = new HeldCertificate.Builder()
+        .commonName("example.com")
+        .subjectAlternativeName(localIpAddress)
+        .build();
+    SslClient sslClient = new SslClient.Builder()
+        .certificateChain(heldCertificate.keyPair, heldCertificate.certificate)
+        .addTrustedCertificate(heldCertificate.certificate)
+        .build();
+
+    // Use that certificate on the server and trust it on the client.
+    server.useHttps(sslClient.socketFactory, false);
+    client = client.newBuilder()
+        .sslSocketFactory(sslClient.socketFactory, sslClient.trustManager)
+        .hostnameVerifier(new RecordingHostnameVerifier())
+        .protocols(Collections.singletonList(Protocol.HTTP_1_1))
+        .build();
+
+    // Make a request.
+    server.enqueue(new MockResponse());
+    HttpUrl url = server.url("/").newBuilder()
+        .host(localIpAddress)
+        .build();
+    Request request = new Request.Builder()
+        .url(url)
+        .build();
+    executeSynchronously(request)
+        .assertCode(200);
+
+    // Confirm that the IP address was used in the host header.
+    RecordedRequest recordedRequest = server.takeRequest();
+    assertEquals(localIpAddress + ":" + server.getPort(), recordedRequest.getHeader("Host"));
   }
 
   private void makeFailingCall() {
@@ -2658,10 +3225,10 @@ public final class CallTest {
 
   private void enableTls() {
     client = client.newBuilder()
-        .sslSocketFactory(sslContext.getSocketFactory())
+        .sslSocketFactory(sslClient.socketFactory, sslClient.trustManager)
         .hostnameVerifier(new RecordingHostnameVerifier())
         .build();
-    server.useHttps(sslContext.getSocketFactory(), false);
+    server.useHttps(sslClient.socketFactory, false);
   }
 
   private Buffer gzip(String data) throws IOException {
@@ -2710,6 +3277,6 @@ public final class CallTest {
    * for details.
    */
   private FallbackTestClientSocketFactory suppressTlsFallbackClientSocketFactory() {
-    return new FallbackTestClientSocketFactory(sslContext.getSocketFactory());
+    return new FallbackTestClientSocketFactory(sslClient.socketFactory);
   }
 }

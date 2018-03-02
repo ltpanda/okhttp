@@ -42,11 +42,12 @@ public final class OkHttpClientTest {
     ResponseCache.setDefault(DEFAULT_RESPONSE_CACHE);
   }
 
-  @Test public void timeoutDefaults() {
+  @Test public void durationDefaults() {
     OkHttpClient client = defaultClient();
     assertEquals(10_000, client.connectTimeoutMillis());
     assertEquals(10_000, client.readTimeoutMillis());
     assertEquals(10_000, client.writeTimeoutMillis());
+    assertEquals(0, client.pingIntervalMillis());
   }
 
   @Test public void timeoutValidRange() {
@@ -119,5 +120,84 @@ public final class OkHttpClientTest {
       fail();
     } catch (IllegalArgumentException expected) {
     }
+  }
+
+  @Test public void certificatePinnerEquality() {
+    OkHttpClient clientA = TestUtil.defaultClient();
+    OkHttpClient clientB = TestUtil.defaultClient();
+    assertEquals(clientA.certificatePinner(), clientB.certificatePinner());
+  }
+
+  @Test public void nullInterceptor() {
+    OkHttpClient.Builder builder = new OkHttpClient.Builder();
+    try {
+      builder.addInterceptor(null);
+      fail();
+    } catch (IllegalArgumentException expected) {
+      assertEquals("interceptor == null", expected.getMessage());
+    }
+  }
+
+  @Test public void nullNetworkInterceptor() {
+    OkHttpClient.Builder builder = new OkHttpClient.Builder();
+    try {
+      builder.addNetworkInterceptor(null);
+      fail();
+    } catch (IllegalArgumentException expected) {
+      assertEquals("interceptor == null", expected.getMessage());
+    }
+  }
+
+  @Test public void nullInterceptorInList() {
+    OkHttpClient.Builder builder = new OkHttpClient.Builder();
+    builder.interceptors().add(null);
+    try {
+      builder.build();
+      fail();
+    } catch (IllegalStateException expected) {
+      assertEquals("Null interceptor: [null]", expected.getMessage());
+    }
+  }
+
+  @Test public void nullNetworkInterceptorInList() {
+    OkHttpClient.Builder builder = new OkHttpClient.Builder();
+    builder.networkInterceptors().add(null);
+    try {
+      builder.build();
+      fail();
+    } catch (IllegalStateException expected) {
+      assertEquals("Null network interceptor: [null]", expected.getMessage());
+    }
+  }
+
+  @Test public void testH2COkHttpClientConstructionFallback() {
+    // fallbacks are not allowed when using h2c prior knowledge
+    try {
+      new OkHttpClient.Builder()
+              .protocols(Arrays.asList(Protocol.H2C, Protocol.HTTP_1_1));
+      fail("When H2C is specified, no other protocol can be specified");
+    } catch (IllegalArgumentException expected) {
+      assertEquals("protocols containing h2c cannot use other protocols: [h2c, http/1.1]", expected.getMessage());
+    }
+  }
+
+  @Test public void testH2COkHttpClientConstructionDuplicates() {
+    // Treating this use case as user error
+    try {
+      new OkHttpClient.Builder()
+              .protocols(Arrays.asList(Protocol.H2C, Protocol.H2C));
+      fail("When H2C is specified, no other protocol can be specified");
+    } catch (IllegalArgumentException expected) {
+      assertEquals("protocols containing h2c cannot use other protocols: [h2c, h2c]", expected.getMessage());
+    }
+  }
+
+  @Test public void testH2COkHttpClientConstructionSuccess() {
+    OkHttpClient okHttpClient = new OkHttpClient.Builder()
+            .protocols(Arrays.asList(Protocol.H2C))
+            .build();
+
+    assertEquals(1, okHttpClient.protocols().size());
+    assertEquals(Protocol.H2C, okHttpClient.protocols().get(0));
   }
 }

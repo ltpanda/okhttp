@@ -31,7 +31,7 @@ import java.security.cert.CertificateFactory;
 import java.security.cert.X509Certificate;
 import java.util.Arrays;
 import java.util.Collections;
-import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
@@ -47,6 +47,7 @@ import okhttp3.Request;
 import okhttp3.RequestBody;
 import okhttp3.Response;
 import okhttp3.ResponseBody;
+import okhttp3.TlsVersion;
 import okhttp3.internal.Internal;
 import okhttp3.internal.Util;
 import okhttp3.mockwebserver.MockWebServer;
@@ -106,7 +107,7 @@ public class JavaApiConverterTest {
     Request request = new Request.Builder().url(uri.toURL()).build();
     CacheResponse cacheResponse = new CacheResponse() {
       @Override public Map<String, List<String>> getHeaders() throws IOException {
-        Map<String, List<String>> headers = new HashMap<>();
+        Map<String, List<String>> headers = new LinkedHashMap<>();
         headers.put(null, Collections.singletonList(statusLine));
         headers.put("xyzzy", Arrays.asList("bar", "baz"));
         return headers;
@@ -138,7 +139,7 @@ public class JavaApiConverterTest {
     Request request = new Request.Builder().url(uri.toURL()).build();
     CacheResponse cacheResponse = new CacheResponse() {
       @Override public Map<String, List<String>> getHeaders() throws IOException {
-        Map<String, List<String>> headers = new HashMap<>();
+        Map<String, List<String>> headers = new LinkedHashMap<>();
         // Headers is deliberately missing an entry with a null key.
         headers.put("xyzzy", Arrays.asList("bar", "baz"));
         return headers;
@@ -166,7 +167,7 @@ public class JavaApiConverterTest {
     Request request = new Request.Builder().url(uri.toURL()).build();
     SecureCacheResponse cacheResponse = new SecureCacheResponse() {
       @Override public Map<String, List<String>> getHeaders() throws IOException {
-        Map<String, List<String>> headers = new HashMap<>();
+        Map<String, List<String>> headers = new LinkedHashMap<>();
         headers.put(null, Collections.singletonList(statusLine));
         headers.put("xyzzy", Arrays.asList("bar", "baz"));
         return headers;
@@ -235,7 +236,7 @@ public class JavaApiConverterTest {
   @Test public void createOkRequest_nonNullRequestHeaders() throws Exception {
     URI uri = new URI("https://foo/bar");
 
-    Map<String, List<String>> javaRequestHeaders = new HashMap<>();
+    Map<String, List<String>> javaRequestHeaders = new LinkedHashMap<>();
     javaRequestHeaders.put("Foo", Arrays.asList("Bar"));
     Request request = JavaApiConverter.createOkRequest(uri, "POST", javaRequestHeaders);
     assertTrue(request.isHttps());
@@ -253,7 +254,7 @@ public class JavaApiConverterTest {
   @Test public void createOkRequest_nullRequestHeaderKey() throws Exception {
     URI uri = new URI("https://foo/bar");
 
-    Map<String, List<String>> javaRequestHeaders = new HashMap<>();
+    Map<String, List<String>> javaRequestHeaders = new LinkedHashMap<>();
     javaRequestHeaders.put(null, Arrays.asList("GET / HTTP 1.1"));
     javaRequestHeaders.put("Foo", Arrays.asList("Bar"));
     Request request = JavaApiConverter.createOkRequest(uri, "POST", javaRequestHeaders);
@@ -464,7 +465,7 @@ public class JavaApiConverterTest {
         .get()
         .url("https://secure/request")
         .build();
-    Handshake handshake = Handshake.get(null, CipherSuite.TLS_RSA_WITH_NULL_MD5,
+    Handshake handshake = Handshake.get(TlsVersion.SSL_3_0, CipherSuite.TLS_RSA_WITH_NULL_MD5,
         Arrays.<Certificate>asList(SERVER_CERT), Arrays.<Certificate>asList(LOCAL_CERT));
     Response okResponse = createArbitraryOkResponse(okRequest).newBuilder()
         .handshake(handshake)
@@ -554,7 +555,7 @@ public class JavaApiConverterTest {
             .post(createRequestBody("RequestBody"))
             .build();
     ResponseBody responseBody = createResponseBody("ResponseBody");
-    Handshake handshake = Handshake.get(null, CipherSuite.TLS_RSA_WITH_NULL_MD5,
+    Handshake handshake = Handshake.get(TlsVersion.SSL_3_0, CipherSuite.TLS_RSA_WITH_NULL_MD5,
         Arrays.<Certificate>asList(SERVER_CERT), Arrays.<Certificate>asList(LOCAL_CERT));
     Response okResponse = createArbitraryOkResponse(okRequest).newBuilder()
         .protocol(Protocol.HTTP_1_1)
@@ -592,7 +593,7 @@ public class JavaApiConverterTest {
   }
 
   @Test public void extractOkHeaders() {
-    Map<String, List<String>> javaResponseHeaders = new HashMap<>();
+    Map<String, List<String>> javaResponseHeaders = new LinkedHashMap<>();
     javaResponseHeaders.put(null, Arrays.asList("StatusLine"));
     javaResponseHeaders.put("key1", Arrays.asList("value1_1", "value1_2"));
     javaResponseHeaders.put("key2", Arrays.asList("value2"));
@@ -604,7 +605,7 @@ public class JavaApiConverterTest {
   }
 
   @Test public void extractStatusLine() throws Exception {
-    Map<String, List<String>> javaResponseHeaders = new HashMap<>();
+    Map<String, List<String>> javaResponseHeaders = new LinkedHashMap<>();
     javaResponseHeaders.put(null, Arrays.asList("StatusLine"));
     javaResponseHeaders.put("key1", Arrays.asList("value1_1", "value1_2"));
     javaResponseHeaders.put("key2", Arrays.asList("value2"));

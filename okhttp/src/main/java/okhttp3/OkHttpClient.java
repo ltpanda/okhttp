@@ -18,13 +18,18 @@ package okhttp3;
 import java.net.MalformedURLException;
 import java.net.Proxy;
 import java.net.ProxySelector;
+import java.net.Socket;
 import java.net.UnknownHostException;
 import java.security.GeneralSecurityException;
 import java.security.KeyStore;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.List;
+import java.util.Random;
+import java.util.concurrent.ExecutorService;
 import java.util.concurrent.TimeUnit;
+import javax.annotation.Nullable;
 import javax.net.SocketFactory;
 import javax.net.ssl.HostnameVerifier;
 import javax.net.ssl.SSLContext;
@@ -34,47 +39,99 @@ import javax.net.ssl.TrustManager;
 import javax.net.ssl.TrustManagerFactory;
 import javax.net.ssl.X509TrustManager;
 import okhttp3.internal.Internal;
-import okhttp3.internal.InternalCache;
-import okhttp3.internal.Platform;
-import okhttp3.internal.RouteDatabase;
 import okhttp3.internal.Util;
-import okhttp3.internal.http.StreamAllocation;
-import okhttp3.internal.io.RealConnection;
+import okhttp3.internal.cache.InternalCache;
+import okhttp3.internal.connection.RealConnection;
+import okhttp3.internal.connection.RouteDatabase;
+import okhttp3.internal.connection.StreamAllocation;
+import okhttp3.internal.platform.Platform;
 import okhttp3.internal.tls.CertificateChainCleaner;
 import okhttp3.internal.tls.OkHostnameVerifier;
+import okhttp3.internal.ws.RealWebSocket;
+import okio.Sink;
+import okio.Source;
+
+import static okhttp3.internal.Util.assertionError;
+import static okhttp3.internal.Util.checkDuration;
 
 /**
  * Factory for {@linkplain Call calls}, which can be used to send HTTP requests and read their
- * responses. Most applications can use a single OkHttpClient for all of their HTTP requests,
- * benefiting from a shared response cache, thread pool, connection re-use, etc.
+ * responses.
  *
- * <p>To create an {@code OkHttpClient} with the default settings, use the {@linkplain
- * #OkHttpClient() default constructor}. Or create a configured instance with {@link
- * OkHttpClient.Builder}. To adjust an existing client before making a request, use {@link
- * #newBuilder()}. This example shows a call with a 30 second timeout:
+ * <h3>OkHttpClients should be shared</h3>
+ *
+ * <p>OkHttp performs best when you create a single {@code OkHttpClient} instance and reuse it for
+ * all of your HTTP calls. This is because each client holds its own connection pool and thread
+ * pools. Reusing connections and threads reduces latency and saves memory. Conversely, creating a
+ * client for each request wastes resources on idle pools.
+ *
+ * <p>Use {@code new OkHttpClient()} to create a shared instance with the default settings:
  * <pre>   {@code
  *
- *   OkHttpClient client = ...
- *   OkHttpClient clientWith30sTimeout = client.newBuilder()
- *       .readTimeout(30, TimeUnit.SECONDS)
- *       .build();
- *   Response response = clientWith30sTimeout.newCall(request).execute();
+ *   // The singleton HTTP client.
+ *   public final OkHttpClient client = new OkHttpClient();
  * }</pre>
+ *
+ * <p>Or use {@code new OkHttpClient.Builder()} to create a shared instance with custom settings:
+ * <pre>   {@code
+ *
+ *   // The singleton HTTP client.
+ *   public final OkHttpClient client = new OkHttpClient.Builder()
+ *       .addInterceptor(new HttpLoggingInterceptor())
+ *       .cache(new Cache(cacheDir, cacheSize))
+ *       .build();
+ * }</pre>
+ *
+ * <h3>Customize your client with newBuilder()</h3>
+ *
+ * <p>You can customize a shared OkHttpClient instance with {@link #newBuilder()}. This builds a
+ * client that shares the same connection pool, thread pools, and configuration. Use the builder
+ * methods to configure the derived client for a specific purpose.
+ *
+ * <p>This example shows a call with a short 500 millisecond timeout: <pre>   {@code
+ *
+ *   OkHttpClient eagerClient = client.newBuilder()
+ *       .readTimeout(500, TimeUnit.MILLISECONDS)
+ *       .build();
+ *   Response response = eagerClient.newCall(request).execute();
+ * }</pre>
+ *
+ * <h3>Shutdown isn't necessary</h3>
+ *
+ * <p>The threads and connections that are held will be released automatically if they remain idle.
+ * But if you are writing a application that needs to aggressively release unused resources you may
+ * do so.
+ *
+ * <p>Shutdown the dispatcher's executor service with {@link ExecutorService#shutdown shutdown()}.
+ * This will also cause future calls to the client to be rejected. <pre>   {@code
+ *
+ *     client.dispatcher().executorService().shutdown();
+ * }</pre>
+ *
+ * <p>Clear the connection pool with {@link ConnectionPool#evictAll() evictAll()}. Note that the
+ * connection pool's daemon thread may not exit immediately. <pre>   {@code
+ *
+ *     client.connectionPool().evictAll();
+ * }</pre>
+ *
+ * <p>If your client has a cache, call {@link Cache#close close()}. Note that it is an error to
+ * create calls against a cache that is closed, and doing so will cause the call to crash.
+ * <pre>   {@code
+ *
+ *     client.cache().close();
+ * }</pre>
+ *
+ * <p>OkHttp also uses daemon threads for HTTP/2 connections. These will exit automatically if they
+ * remain idle.
  */
-public class OkHttpClient implements Cloneable, Call.Factory {
-  private static final List<Protocol> DEFAULT_PROTOCOLS = Util.immutableList(
-      Protocol.HTTP_2, Protocol.SPDY_3, Protocol.HTTP_1_1);
+public class OkHttpClient implements Cloneable, Call.Factory, WebSocket.Factory {
+  static final List<Protocol> DEFAULT_PROTOCOLS = Util.immutableList(
+      Protocol.HTTP_2, Protocol.HTTP_1_1);
 
-  private static final List<ConnectionSpec> DEFAULT_CONNECTION_SPECS;
+  static final List<ConnectionSpec> DEFAULT_CONNECTION_SPECS = Util.immutableList(
+      ConnectionSpec.MODERN_TLS, ConnectionSpec.CLEARTEXT);
 
   static {
-    List<ConnectionSpec> connSpecs = new ArrayList<>(Arrays.asList(ConnectionSpec.MODERN_TLS,
-        ConnectionSpec.COMPATIBLE_TLS));
-    if (Platform.get().isCleartextTrafficPermitted()) {
-      connSpecs.add(ConnectionSpec.CLEARTEXT);
-    }
-    DEFAULT_CONNECTION_SPECS = Util.immutableList(connSpecs);
-
     Internal.instance = new Internal() {
       @Override public void addLenient(Headers.Builder builder, String line) {
         builder.addLenient(line);
@@ -88,18 +145,23 @@ public class OkHttpClient implements Cloneable, Call.Factory {
         builder.setInternalCache(internalCache);
       }
 
-      @Override public InternalCache internalCache(OkHttpClient client) {
-        return client.internalCache();
-      }
-
       @Override public boolean connectionBecameIdle(
           ConnectionPool pool, RealConnection connection) {
         return pool.connectionBecameIdle(connection);
       }
 
-      @Override public RealConnection get(
+      @Override public RealConnection get(ConnectionPool pool, Address address,
+          StreamAllocation streamAllocation, Route route) {
+        return pool.get(address, streamAllocation, route);
+      }
+
+      @Override public boolean equalsNonHost(Address a, Address b) {
+        return a.equalsNonHost(b);
+      }
+
+      @Override public Socket deduplicate(
           ConnectionPool pool, Address address, StreamAllocation streamAllocation) {
-        return pool.get(address, streamAllocation);
+        return pool.deduplicate(address, streamAllocation);
       }
 
       @Override public void put(ConnectionPool pool, RealConnection connection) {
@@ -110,13 +172,8 @@ public class OkHttpClient implements Cloneable, Call.Factory {
         return connectionPool.routeDatabase;
       }
 
-      @Override
-      public void callEnqueue(Call call, Callback responseCallback, boolean forWebSocket) {
-        ((RealCall) call).enqueue(responseCallback, forWebSocket);
-      }
-
-      @Override public StreamAllocation callEngineGetStreamAllocation(Call call) {
-        return ((RealCall) call).engine.streamAllocation;
+      @Override public int code(Response.Builder responseBuilder) {
+        return responseBuilder.code;
       }
 
       @Override
@@ -128,22 +185,31 @@ public class OkHttpClient implements Cloneable, Call.Factory {
           throws MalformedURLException, UnknownHostException {
         return HttpUrl.getChecked(url);
       }
+
+      @Override public StreamAllocation streamAllocation(Call call) {
+        return ((RealCall) call).streamAllocation();
+      }
+
+      @Override public Call newWebSocketCall(OkHttpClient client, Request originalRequest) {
+        return RealCall.newRealCall(client, originalRequest, true);
+      }
     };
   }
 
   final Dispatcher dispatcher;
-  final Proxy proxy;
+  final @Nullable Proxy proxy;
   final List<Protocol> protocols;
   final List<ConnectionSpec> connectionSpecs;
   final List<Interceptor> interceptors;
   final List<Interceptor> networkInterceptors;
+  final EventListener.Factory eventListenerFactory;
   final ProxySelector proxySelector;
   final CookieJar cookieJar;
-  final Cache cache;
-  final InternalCache internalCache;
+  final @Nullable Cache cache;
+  final @Nullable InternalCache internalCache;
   final SocketFactory socketFactory;
-  final SSLSocketFactory sslSocketFactory;
-  final CertificateChainCleaner certificateChainCleaner;
+  final @Nullable SSLSocketFactory sslSocketFactory;
+  final @Nullable CertificateChainCleaner certificateChainCleaner;
   final HostnameVerifier hostnameVerifier;
   final CertificatePinner certificatePinner;
   final Authenticator proxyAuthenticator;
@@ -156,18 +222,20 @@ public class OkHttpClient implements Cloneable, Call.Factory {
   final int connectTimeout;
   final int readTimeout;
   final int writeTimeout;
+  final int pingInterval;
 
   public OkHttpClient() {
     this(new Builder());
   }
 
-  private OkHttpClient(Builder builder) {
+  OkHttpClient(Builder builder) {
     this.dispatcher = builder.dispatcher;
     this.proxy = builder.proxy;
     this.protocols = builder.protocols;
     this.connectionSpecs = builder.connectionSpecs;
     this.interceptors = Util.immutableList(builder.interceptors);
     this.networkInterceptors = Util.immutableList(builder.networkInterceptors);
+    this.eventListenerFactory = builder.eventListenerFactory;
     this.proxySelector = builder.proxySelector;
     this.cookieJar = builder.cookieJar;
     this.cache = builder.cache;
@@ -188,6 +256,10 @@ public class OkHttpClient implements Cloneable, Call.Factory {
       this.certificateChainCleaner = CertificateChainCleaner.get(trustManager);
     }
 
+    if (sslSocketFactory != null) {
+      Platform.get().configureSslSocketFactory(sslSocketFactory);
+    }
+
     this.hostnameVerifier = builder.hostnameVerifier;
     this.certificatePinner = builder.certificatePinner.withCertificateChainCleaner(
         certificateChainCleaner);
@@ -201,6 +273,14 @@ public class OkHttpClient implements Cloneable, Call.Factory {
     this.connectTimeout = builder.connectTimeout;
     this.readTimeout = builder.readTimeout;
     this.writeTimeout = builder.writeTimeout;
+    this.pingInterval = builder.pingInterval;
+
+    if (interceptors.contains(null)) {
+      throw new IllegalStateException("Null interceptor: " + interceptors);
+    }
+    if (networkInterceptors.contains(null)) {
+      throw new IllegalStateException("Null network interceptor: " + networkInterceptors);
+    }
   }
 
   private X509TrustManager systemDefaultTrustManager() {
@@ -215,17 +295,17 @@ public class OkHttpClient implements Cloneable, Call.Factory {
       }
       return (X509TrustManager) trustManagers[0];
     } catch (GeneralSecurityException e) {
-      throw new AssertionError(); // The system has no TLS. Just give up.
+      throw assertionError("No System TLS", e); // The system has no TLS. Just give up.
     }
   }
 
   private SSLSocketFactory systemDefaultSslSocketFactory(X509TrustManager trustManager) {
     try {
-      SSLContext sslContext = SSLContext.getInstance("TLS");
+      SSLContext sslContext = Platform.get().getSSLContext();
       sslContext.init(null, new TrustManager[] { trustManager }, null);
       return sslContext.getSocketFactory();
     } catch (GeneralSecurityException e) {
-      throw new AssertionError(); // The system has no TLS. Just give up.
+      throw assertionError("No System TLS", e); // The system has no TLS. Just give up.
     }
   }
 
@@ -242,6 +322,11 @@ public class OkHttpClient implements Cloneable, Call.Factory {
   /** Default write timeout (in milliseconds). */
   public int writeTimeoutMillis() {
     return writeTimeout;
+  }
+
+  /** Web socket ping interval (in milliseconds). */
+  public int pingIntervalMillis() {
+    return pingInterval;
   }
 
   public Proxy proxy() {
@@ -338,11 +423,24 @@ public class OkHttpClient implements Cloneable, Call.Factory {
     return networkInterceptors;
   }
 
+  public EventListener.Factory eventListenerFactory() {
+    return eventListenerFactory;
+  }
+
   /**
    * Prepares the {@code request} to be executed at some point in the future.
    */
   @Override public Call newCall(Request request) {
-    return new RealCall(this, request);
+    return RealCall.newRealCall(this, request, false /* for web socket */);
+  }
+
+  /**
+   * Uses {@code request} to connect a new web socket.
+   */
+  @Override public WebSocket newWebSocket(Request request, WebSocketListener listener) {
+    RealWebSocket webSocket = new RealWebSocket(request, listener, new Random(), pingInterval);
+    webSocket.connect(this);
+    return webSocket;
   }
 
   public Builder newBuilder() {
@@ -351,18 +449,19 @@ public class OkHttpClient implements Cloneable, Call.Factory {
 
   public static final class Builder {
     Dispatcher dispatcher;
-    Proxy proxy;
+    @Nullable Proxy proxy;
     List<Protocol> protocols;
     List<ConnectionSpec> connectionSpecs;
     final List<Interceptor> interceptors = new ArrayList<>();
     final List<Interceptor> networkInterceptors = new ArrayList<>();
+    EventListener.Factory eventListenerFactory;
     ProxySelector proxySelector;
     CookieJar cookieJar;
-    Cache cache;
-    InternalCache internalCache;
+    @Nullable Cache cache;
+    @Nullable InternalCache internalCache;
     SocketFactory socketFactory;
-    SSLSocketFactory sslSocketFactory;
-    CertificateChainCleaner certificateChainCleaner;
+    @Nullable SSLSocketFactory sslSocketFactory;
+    @Nullable CertificateChainCleaner certificateChainCleaner;
     HostnameVerifier hostnameVerifier;
     CertificatePinner certificatePinner;
     Authenticator proxyAuthenticator;
@@ -375,11 +474,13 @@ public class OkHttpClient implements Cloneable, Call.Factory {
     int connectTimeout;
     int readTimeout;
     int writeTimeout;
+    int pingInterval;
 
     public Builder() {
       dispatcher = new Dispatcher();
       protocols = DEFAULT_PROTOCOLS;
       connectionSpecs = DEFAULT_CONNECTION_SPECS;
+      eventListenerFactory = EventListener.factory(EventListener.NONE);
       proxySelector = ProxySelector.getDefault();
       cookieJar = CookieJar.NO_COOKIES;
       socketFactory = SocketFactory.getDefault();
@@ -395,6 +496,7 @@ public class OkHttpClient implements Cloneable, Call.Factory {
       connectTimeout = 10_000;
       readTimeout = 10_000;
       writeTimeout = 10_000;
+      pingInterval = 0;
     }
 
     Builder(OkHttpClient okHttpClient) {
@@ -404,6 +506,7 @@ public class OkHttpClient implements Cloneable, Call.Factory {
       this.connectionSpecs = okHttpClient.connectionSpecs;
       this.interceptors.addAll(okHttpClient.interceptors);
       this.networkInterceptors.addAll(okHttpClient.networkInterceptors);
+      this.eventListenerFactory = okHttpClient.eventListenerFactory;
       this.proxySelector = okHttpClient.proxySelector;
       this.cookieJar = okHttpClient.cookieJar;
       this.internalCache = okHttpClient.internalCache;
@@ -423,57 +526,75 @@ public class OkHttpClient implements Cloneable, Call.Factory {
       this.connectTimeout = okHttpClient.connectTimeout;
       this.readTimeout = okHttpClient.readTimeout;
       this.writeTimeout = okHttpClient.writeTimeout;
+      this.pingInterval = okHttpClient.pingInterval;
     }
 
     /**
      * Sets the default connect timeout for new connections. A value of 0 means no timeout,
      * otherwise values must be between 1 and {@link Integer#MAX_VALUE} when converted to
      * milliseconds.
+     *
+     * <p>The connectTimeout is applied when connecting a TCP socket to the target host.
+     * The default value is 10 seconds.
      */
     public Builder connectTimeout(long timeout, TimeUnit unit) {
-      if (timeout < 0) throw new IllegalArgumentException("timeout < 0");
-      if (unit == null) throw new NullPointerException("unit == null");
-      long millis = unit.toMillis(timeout);
-      if (millis > Integer.MAX_VALUE) throw new IllegalArgumentException("Timeout too large.");
-      if (millis == 0 && timeout > 0) throw new IllegalArgumentException("Timeout too small.");
-      connectTimeout = (int) millis;
+      connectTimeout = checkDuration("timeout", timeout, unit);
       return this;
     }
 
     /**
      * Sets the default read timeout for new connections. A value of 0 means no timeout, otherwise
      * values must be between 1 and {@link Integer#MAX_VALUE} when converted to milliseconds.
+     *
+     * <p>The read timeout is applied to both the TCP socket and for individual read IO operations
+     * including on {@link Source} of the {@link Response}. The default value is 10 seconds.
+     *
+     * @see Socket#setSoTimeout(int)
+     * @see Source#timeout()
      */
     public Builder readTimeout(long timeout, TimeUnit unit) {
-      if (timeout < 0) throw new IllegalArgumentException("timeout < 0");
-      if (unit == null) throw new NullPointerException("unit == null");
-      long millis = unit.toMillis(timeout);
-      if (millis > Integer.MAX_VALUE) throw new IllegalArgumentException("Timeout too large.");
-      if (millis == 0 && timeout > 0) throw new IllegalArgumentException("Timeout too small.");
-      readTimeout = (int) millis;
+      readTimeout = checkDuration("timeout", timeout, unit);
       return this;
     }
 
     /**
      * Sets the default write timeout for new connections. A value of 0 means no timeout, otherwise
      * values must be between 1 and {@link Integer#MAX_VALUE} when converted to milliseconds.
+     *
+     * <p>The write timeout is applied for individual write IO operations.
+     * The default value is 10 seconds.
+     *
+     * @see Sink#timeout()
      */
     public Builder writeTimeout(long timeout, TimeUnit unit) {
-      if (timeout < 0) throw new IllegalArgumentException("timeout < 0");
-      if (unit == null) throw new NullPointerException("unit == null");
-      long millis = unit.toMillis(timeout);
-      if (millis > Integer.MAX_VALUE) throw new IllegalArgumentException("Timeout too large.");
-      if (millis == 0 && timeout > 0) throw new IllegalArgumentException("Timeout too small.");
-      writeTimeout = (int) millis;
+      writeTimeout = checkDuration("timeout", timeout, unit);
+      return this;
+    }
+
+    /**
+     * Sets the interval between HTTP/2 and web socket pings initiated by this client. Use this to
+     * automatically send ping frames until either the connection fails or it is closed. This keeps
+     * the connection alive and may detect connectivity failures.
+     *
+     * <p>If the server does not respond to each ping with a pong within {@code interval}, this
+     * client will assume that connectivity has been lost. When this happens on a web socket the
+     * connection is canceled and its listener is {@linkplain WebSocketListener#onFailure notified
+     * of the failure}. When it happens on an HTTP/2 connection the connection is closed and any
+     * calls it is carrying {@linkplain java.io.IOException will fail with an IOException}.
+     *
+     * <p>The default value of 0 disables client-initiated pings.
+     */
+    public Builder pingInterval(long interval, TimeUnit unit) {
+      pingInterval = checkDuration("interval", interval, unit);
       return this;
     }
 
     /**
      * Sets the HTTP proxy that will be used by connections created by this client. This takes
      * precedence over {@link #proxySelector}, which is only honored when this proxy is null (which
-     * it is by default). To disable proxy use completely, call {@code setProxy(Proxy.NO_PROXY)}.
+     * it is by default). To disable proxy use completely, call {@code proxy(Proxy.NO_PROXY)}.
      */
-    public Builder proxy(Proxy proxy) {
+    public Builder proxy(@Nullable Proxy proxy) {
       this.proxy = proxy;
       return this;
     }
@@ -504,12 +625,13 @@ public class OkHttpClient implements Cloneable, Call.Factory {
     }
 
     /** Sets the response cache to be used to read and write cached responses. */
-    void setInternalCache(InternalCache internalCache) {
+    void setInternalCache(@Nullable InternalCache internalCache) {
       this.internalCache = internalCache;
       this.cache = null;
     }
 
-    public Builder cache(Cache cache) {
+    /** Sets the response cache to be used to read and write cached responses. */
+    public Builder cache(@Nullable Cache cache) {
       this.cache = cache;
       this.internalCache = null;
       return this;
@@ -551,13 +673,8 @@ public class OkHttpClient implements Cloneable, Call.Factory {
      */
     public Builder sslSocketFactory(SSLSocketFactory sslSocketFactory) {
       if (sslSocketFactory == null) throw new NullPointerException("sslSocketFactory == null");
-      X509TrustManager trustManager = Platform.get().trustManager(sslSocketFactory);
-      if (trustManager == null) {
-        throw new IllegalStateException("Unable to extract the trust manager on " + Platform.get()
-            + ", sslSocketFactory is " + sslSocketFactory.getClass());
-      }
       this.sslSocketFactory = sslSocketFactory;
-      this.certificateChainCleaner = CertificateChainCleaner.get(trustManager);
+      this.certificateChainCleaner = Platform.get().buildCertificateChainCleaner(sslSocketFactory);
       return this;
     }
 
@@ -587,7 +704,7 @@ public class OkHttpClient implements Cloneable, Call.Factory {
      *   SSLSocketFactory sslSocketFactory = sslContext.getSocketFactory();
      *
      *   OkHttpClient client = new OkHttpClient.Builder()
-     *       .sslSocketFactory(sslSocketFactory, trustManager);
+     *       .sslSocketFactory(sslSocketFactory, trustManager)
      *       .build();
      * }</pre>
      */
@@ -669,7 +786,7 @@ public class OkHttpClient implements Cloneable, Call.Factory {
       return this;
     }
 
-    /** Configure this client to follow redirects. If unset, redirects be followed. */
+    /** Configure this client to follow redirects. If unset, redirects will be followed. */
     public Builder followRedirects(boolean followRedirects) {
       this.followRedirects = followRedirects;
       return this;
@@ -711,14 +828,12 @@ public class OkHttpClient implements Cloneable, Call.Factory {
      * Configure the protocols used by this client to communicate with remote servers. By default
      * this client will prefer the most efficient transport available, falling back to more
      * ubiquitous protocols. Applications should only call this method to avoid specific
-     * compatibility problems, such as web servers that behave incorrectly when SPDY is enabled.
+     * compatibility problems, such as web servers that behave incorrectly when HTTP/2 is enabled.
      *
      * <p>The following protocols are currently supported:
      *
      * <ul>
      *     <li><a href="http://www.w3.org/Protocols/rfc2616/rfc2616.html">http/1.1</a>
-     *     <li><a
-     *         href="http://www.chromium.org/spdy/spdy-protocol/spdy-protocol-draft3-1">spdy/3.1</a>
      *     <li><a href="http://tools.ietf.org/html/draft-ietf-httpbis-http2-17">h2</a>
      * </ul>
      *
@@ -734,11 +849,19 @@ public class OkHttpClient implements Cloneable, Call.Factory {
      * Response#protocol()}.
      *
      * @param protocols the protocols to use, in order of preference. The list must contain {@link
-     * Protocol#HTTP_1_1}. It must not contain null or {@link Protocol#HTTP_1_0}.
+     * Protocol#HTTP_1_1}. It should not contain null or {@link Protocol#HTTP_1_0}. If you use
+     * {@link Protocol#H2C}, then it should be the only specified protocol in the list.
      */
     public Builder protocols(List<Protocol> protocols) {
-      protocols = Util.immutableList(protocols);
-      if (!protocols.contains(Protocol.HTTP_1_1)) {
+      // Create a private copy of the list.
+      protocols = new ArrayList<>(protocols);
+
+      if (protocols.contains(Protocol.H2C) && protocols.size() > 1) {
+        // when using h2c prior knowledge, no other protocol should be supported.
+        throw new IllegalArgumentException("protocols containing h2c cannot use other protocols: "
+                + protocols);
+      } else if (!protocols.contains(Protocol.H2C) && !protocols.contains(Protocol.HTTP_1_1)) {
+        // Validate that the list has everything we require and nothing we forbid.
         throw new IllegalArgumentException("protocols doesn't contain http/1.1: " + protocols);
       }
       if (protocols.contains(Protocol.HTTP_1_0)) {
@@ -747,7 +870,12 @@ public class OkHttpClient implements Cloneable, Call.Factory {
       if (protocols.contains(null)) {
         throw new IllegalArgumentException("protocols must not contain null");
       }
-      this.protocols = Util.immutableList(protocols);
+
+      // Remove protocols that we no longer support.
+      protocols.remove(Protocol.SPDY_3);
+
+      // Assign as an unmodifiable list. This is effectively immutable.
+      this.protocols = Collections.unmodifiableList(protocols);
       return this;
     }
 
@@ -766,6 +894,7 @@ public class OkHttpClient implements Cloneable, Call.Factory {
     }
 
     public Builder addInterceptor(Interceptor interceptor) {
+      if (interceptor == null) throw new IllegalArgumentException("interceptor == null");
       interceptors.add(interceptor);
       return this;
     }
@@ -780,7 +909,34 @@ public class OkHttpClient implements Cloneable, Call.Factory {
     }
 
     public Builder addNetworkInterceptor(Interceptor interceptor) {
+      if (interceptor == null) throw new IllegalArgumentException("interceptor == null");
       networkInterceptors.add(interceptor);
+      return this;
+    }
+
+    /**
+     * Configure a single client scoped listener that will receive all analytic events
+     * for this client.
+     *
+     * @see EventListener for semantics and restrictions on listener implementations.
+     */
+    public Builder eventListener(EventListener eventListener) {
+      if (eventListener == null) throw new NullPointerException("eventListener == null");
+      this.eventListenerFactory = EventListener.factory(eventListener);
+      return this;
+    }
+
+    /**
+     * Configure a factory to provide per-call scoped listeners that will receive analytic events
+     * for this client.
+     *
+     * @see EventListener for semantics and restrictions on listener implementations.
+     */
+    public Builder eventListenerFactory(EventListener.Factory eventListenerFactory) {
+      if (eventListenerFactory == null) {
+        throw new NullPointerException("eventListenerFactory == null");
+      }
+      this.eventListenerFactory = eventListenerFactory;
       return this;
     }
 

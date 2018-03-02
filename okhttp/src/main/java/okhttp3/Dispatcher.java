@@ -25,6 +25,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.SynchronousQueue;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
+import javax.annotation.Nullable;
 import okhttp3.RealCall.AsyncCall;
 import okhttp3.internal.Util;
 
@@ -38,9 +39,10 @@ import okhttp3.internal.Util;
 public final class Dispatcher {
   private int maxRequests = 64;
   private int maxRequestsPerHost = 5;
+  private @Nullable Runnable idleCallback;
 
   /** Executes calls. Created lazily. */
-  private ExecutorService executorService;
+  private @Nullable ExecutorService executorService;
 
   /** Ready async calls in the order they'll be run. */
   private final Deque<AsyncCall> readyAsyncCalls = new ArrayDeque<>();
@@ -93,6 +95,8 @@ public final class Dispatcher {
    *
    * <p>If more than {@code maxRequestsPerHost} requests are in flight when this is invoked, those
    * requests will remain in flight.
+   *
+   * <p>WebSocket connections to hosts <b>do not</b> count against this limit.
    */
   public synchronized void setMaxRequestsPerHost(int maxRequestsPerHost) {
     if (maxRequestsPerHost < 1) {
@@ -104,6 +108,22 @@ public final class Dispatcher {
 
   public synchronized int getMaxRequestsPerHost() {
     return maxRequestsPerHost;
+  }
+
+  /**
+   * Set a callback to be invoked each time the dispatcher becomes idle (when the number of running
+   * calls returns to zero).
+   *
+   * <p>Note: The time at which a {@linkplain Call call} is considered idle is different depending
+   * on whether it was run {@linkplain Call#enqueue(Callback) asynchronously} or
+   * {@linkplain Call#execute() synchronously}. Asynchronous calls become idle after the
+   * {@link Callback#onResponse onResponse} or {@link Callback#onFailure onFailure} callback has
+   * returned. Synchronous calls become idle once {@link Call#execute() execute()} returns. This
+   * means that if you are doing synchronous calls the network layer will not truly be idle until
+   * every returned {@link Response} has been closed.
+   */
+  public synchronized void setIdleCallback(@Nullable Runnable idleCallback) {
+    this.idleCallback = idleCallback;
   }
 
   synchronized void enqueue(AsyncCall call) {
@@ -121,22 +141,16 @@ public final class Dispatcher {
    */
   public synchronized void cancelAll() {
     for (AsyncCall call : readyAsyncCalls) {
-      call.cancel();
+      call.get().cancel();
     }
 
     for (AsyncCall call : runningAsyncCalls) {
-      call.cancel();
+      call.get().cancel();
     }
 
     for (RealCall call : runningSyncCalls) {
       call.cancel();
     }
-  }
-
-  /** Used by {@code AsyncCall#run} to signal completion. */
-  synchronized void finished(AsyncCall call) {
-    if (!runningAsyncCalls.remove(call)) throw new AssertionError("AsyncCall wasn't running!");
-    promoteCalls();
   }
 
   private void promoteCalls() {
@@ -160,6 +174,7 @@ public final class Dispatcher {
   private int runningCallsForHost(AsyncCall call) {
     int result = 0;
     for (AsyncCall c : runningAsyncCalls) {
+      if (c.get().forWebSocket) continue;
       if (c.host().equals(call.host())) result++;
     }
     return result;
@@ -170,9 +185,29 @@ public final class Dispatcher {
     runningSyncCalls.add(call);
   }
 
+  /** Used by {@code AsyncCall#run} to signal completion. */
+  void finished(AsyncCall call) {
+    finished(runningAsyncCalls, call, true);
+  }
+
   /** Used by {@code Call#execute} to signal completion. */
-  synchronized void finished(Call call) {
-    if (!runningSyncCalls.remove(call)) throw new AssertionError("Call wasn't in-flight!");
+  void finished(RealCall call) {
+    finished(runningSyncCalls, call, false);
+  }
+
+  private <T> void finished(Deque<T> calls, T call, boolean promoteCalls) {
+    int runningCallsCount;
+    Runnable idleCallback;
+    synchronized (this) {
+      if (!calls.remove(call)) throw new AssertionError("Call wasn't in-flight!");
+      if (promoteCalls) promoteCalls();
+      runningCallsCount = runningCallsCount();
+      idleCallback = this.idleCallback;
+    }
+
+    if (runningCallsCount == 0 && idleCallback != null) {
+      idleCallback.run();
+    }
   }
 
   /** Returns a snapshot of the calls currently awaiting execution. */

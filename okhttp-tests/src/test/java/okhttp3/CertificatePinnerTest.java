@@ -21,7 +21,7 @@ import java.util.Collections;
 import java.util.List;
 import javax.net.ssl.SSLPeerUnverifiedException;
 import okhttp3.CertificatePinner.Pin;
-import okhttp3.internal.HeldCertificate;
+import okhttp3.mockwebserver.internal.tls.HeldCertificate;
 import org.junit.Test;
 
 import static org.junit.Assert.assertEquals;
@@ -252,5 +252,55 @@ public final class CertificatePinnerTest {
 
     assertEquals(Collections.emptyList(), certificatePinner.findMatchingPins("example.com"));
     assertEquals(Collections.emptyList(), certificatePinner.findMatchingPins("a.b.example.com"));
+  }
+
+  @Test public void successfulFindMatchingPinsIgnoresCase() {
+    CertificatePinner certificatePinner = new CertificatePinner.Builder()
+        .add("EXAMPLE.com", certA1Sha256Pin)
+        .add("*.MyExample.Com", certB1Sha256Pin)
+        .build();
+
+    List<Pin> expectedPin1 = Arrays.asList(new Pin("EXAMPLE.com", certA1Sha256Pin));
+    assertEquals(expectedPin1, certificatePinner.findMatchingPins("example.com"));
+
+    List<Pin> expectedPin2 = Arrays.asList(new Pin("*.MyExample.Com", certB1Sha256Pin));
+    assertEquals(expectedPin2, certificatePinner.findMatchingPins("a.myexample.com"));
+  }
+
+  @Test public void successfulFindMatchingPinPunycode() {
+    CertificatePinner certificatePinner = new CertificatePinner.Builder()
+        .add("σkhttp.com", certA1Sha256Pin)
+        .build();
+
+    List<Pin> expectedPin = Arrays.asList(new Pin("σkhttp.com", certA1Sha256Pin));
+    assertEquals(expectedPin, certificatePinner.findMatchingPins("xn--khttp-fde.com"));
+  }
+
+  /** https://github.com/square/okhttp/issues/3324 */
+  @Test public void checkSubstringMatch() throws Exception {
+    CertificatePinner certificatePinner = new CertificatePinner.Builder()
+        .add("*.example.com", certA1Sha256Pin)
+        .build();
+
+    assertEquals(Collections.emptyList(),
+        certificatePinner.findMatchingPins("a.example.com.notexample.com"));
+    assertEquals(Collections.emptyList(),
+        certificatePinner.findMatchingPins("example.com.notexample.com"));
+    assertEquals(Collections.emptyList(),
+        certificatePinner.findMatchingPins("notexample.com"));
+    assertEquals(Collections.emptyList(),
+        certificatePinner.findMatchingPins("example.com"));
+    assertEquals(Collections.emptyList(),
+        certificatePinner.findMatchingPins("a.b.example.com"));
+    assertEquals(Collections.emptyList(),
+        certificatePinner.findMatchingPins("ple.com"));
+    assertEquals(Collections.emptyList(),
+        certificatePinner.findMatchingPins("com"));
+
+    Pin expectedPin = new Pin("*.example.com", certA1Sha256Pin);
+    assertEquals(Collections.singletonList(expectedPin),
+        certificatePinner.findMatchingPins("a.example.com"));
+    assertEquals(Collections.singletonList(expectedPin),
+        certificatePinner.findMatchingPins("example.example.com"));
   }
 }

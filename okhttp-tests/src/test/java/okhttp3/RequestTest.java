@@ -156,8 +156,8 @@ public final class RequestTest {
 
   @Test public void headerAcceptsPermittedCharacters() throws Exception {
     Request.Builder builder = new Request.Builder();
-    builder.header("AZab09 ~", "AZab09 ~");
-    builder.addHeader("AZab09 ~", "AZab09 ~");
+    builder.header("AZab09~", "AZab09 ~");
+    builder.addHeader("AZab09~", "AZab09 ~");
   }
 
   @Test public void emptyNameForbidden() throws Exception {
@@ -198,11 +198,20 @@ public final class RequestTest {
     }
   }
 
+  @Test public void headerAllowsTabOnlyInValues() throws Exception {
+    Request.Builder builder = new Request.Builder();
+    builder.header("key", "sample\tvalue");
+    try {
+      builder.header("sample\tkey", "value");
+      fail();
+    } catch (IllegalArgumentException expected) {
+    }
+  }
+
   @Test public void headerForbidsControlCharacters() throws Exception {
     assertForbiddenHeader("\u0000");
     assertForbiddenHeader("\r");
     assertForbiddenHeader("\n");
-    assertForbiddenHeader("\t");
     assertForbiddenHeader("\u001f");
     assertForbiddenHeader("\u007f");
     assertForbiddenHeader("\u0080");

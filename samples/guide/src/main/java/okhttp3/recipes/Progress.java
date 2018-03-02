@@ -36,11 +36,27 @@ public final class Progress {
         .build();
 
     final ProgressListener progressListener = new ProgressListener() {
+      boolean firstUpdate = true;
+
       @Override public void update(long bytesRead, long contentLength, boolean done) {
-        System.out.println(bytesRead);
-        System.out.println(contentLength);
-        System.out.println(done);
-        System.out.format("%d%% done\n", (100 * bytesRead) / contentLength);
+        if (done) {
+          System.out.println("completed");
+        } else {
+          if (firstUpdate) {
+            firstUpdate = false;
+            if (contentLength == -1) {
+              System.out.println("content-length: unknown");
+            } else {
+              System.out.format("content-length: %d\n", contentLength);
+            }
+          }
+
+          System.out.println(bytesRead);
+
+          if (contentLength != -1) {
+            System.out.format("%d%% done\n", (100 * bytesRead) / contentLength);
+          }
+        }
       }
     };
 
@@ -55,10 +71,11 @@ public final class Progress {
         })
         .build();
 
-    Response response = client.newCall(request).execute();
-    if (!response.isSuccessful()) throw new IOException("Unexpected code " + response);
+    try (Response response = client.newCall(request).execute()) {
+      if (!response.isSuccessful()) throw new IOException("Unexpected code " + response);
 
-    System.out.println(response.body().string());
+      System.out.println(response.body().string());
+    }
   }
 
   public static void main(String... args) throws Exception {
@@ -71,7 +88,7 @@ public final class Progress {
     private final ProgressListener progressListener;
     private BufferedSource bufferedSource;
 
-    public ProgressResponseBody(ResponseBody responseBody, ProgressListener progressListener) {
+    ProgressResponseBody(ResponseBody responseBody, ProgressListener progressListener) {
       this.responseBody = responseBody;
       this.progressListener = progressListener;
     }

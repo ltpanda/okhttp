@@ -27,6 +27,7 @@ import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.atomic.AtomicInteger;
 import okhttp3.Cache;
 import okhttp3.HttpUrl;
+import okhttp3.MediaType;
 import okhttp3.OkHttpClient;
 import okhttp3.Request;
 import okhttp3.Response;
@@ -71,10 +72,15 @@ public final class Crawler {
         continue;
       }
 
+      Thread currentThread = Thread.currentThread();
+      String originalName = currentThread.getName();
+      currentThread.setName("Crawler " + url.toString());
       try {
         fetch(url);
       } catch (IOException e) {
         System.out.printf("XXX: %s %s%n", url, e);
+      } finally {
+        currentThread.setName(originalName);
       }
     }
   }
@@ -89,25 +95,33 @@ public final class Crawler {
     Request request = new Request.Builder()
         .url(url)
         .build();
-    Response response = client.newCall(request).execute();
-    String responseSource = response.networkResponse() != null
-        ? ("(network: " + response.networkResponse().code() + " over " + response.protocol() + ")")
-        : "(cache)";
-    int responseCode = response.code();
+    try (Response response = client.newCall(request).execute()) {
+      String responseSource = response.networkResponse() != null ? ("(network: "
+          + response.networkResponse().code()
+          + " over "
+          + response.protocol()
+          + ")") : "(cache)";
+      int responseCode = response.code();
 
-    System.out.printf("%03d: %s %s%n", responseCode, url, responseSource);
+      System.out.printf("%03d: %s %s%n", responseCode, url, responseSource);
 
-    String contentType = response.header("Content-Type");
-    if (responseCode != 200 || contentType == null) {
-      response.body().close();
-      return;
-    }
+      String contentType = response.header("Content-Type");
+      if (responseCode != 200 || contentType == null) {
+        return;
+      }
 
-    Document document = Jsoup.parse(response.body().string(), url.toString());
-    for (Element element : document.select("a[href]")) {
-      String href = element.attr("href");
-      HttpUrl link = response.request().url().resolve(href);
-      if (link != null) queue.add(link);
+      MediaType mediaType = MediaType.parse(contentType);
+      if (mediaType == null || !mediaType.subtype().equalsIgnoreCase("html")) {
+        return;
+      }
+
+      Document document = Jsoup.parse(response.body().string(), url.toString());
+      for (Element element : document.select("a[href]")) {
+        String href = element.attr("href");
+        HttpUrl link = response.request().url().resolve(href);
+        if (link == null) continue; // URL is either invalid or its scheme isn't http/https.
+        queue.add(link.newBuilder().fragment(null).build());
+      }
     }
   }
 

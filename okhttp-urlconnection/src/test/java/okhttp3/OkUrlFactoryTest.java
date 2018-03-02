@@ -2,6 +2,7 @@ package okhttp3;
 
 import java.io.File;
 import java.io.IOException;
+import java.io.InputStream;
 import java.net.HttpURLConnection;
 import java.net.URL;
 import java.text.DateFormat;
@@ -11,13 +12,13 @@ import java.util.Locale;
 import java.util.TimeZone;
 import java.util.concurrent.TimeUnit;
 import javax.net.ssl.HttpsURLConnection;
-import javax.net.ssl.SSLContext;
-import okhttp3.internal.SslContextBuilder;
 import okhttp3.internal.URLFilter;
-import okhttp3.internal.http.OkHeaders;
+import okhttp3.internal.huc.OkHttpURLConnection;
 import okhttp3.internal.io.InMemoryFileSystem;
 import okhttp3.mockwebserver.MockResponse;
 import okhttp3.mockwebserver.MockWebServer;
+import okhttp3.mockwebserver.RecordedRequest;
+import okhttp3.mockwebserver.internal.tls.SslClient;
 import okio.BufferedSource;
 import org.junit.After;
 import org.junit.Before;
@@ -184,10 +185,10 @@ public class OkUrlFactoryTest {
         .setBody("Blocked!"));
     final URL blockedURL = cleartextServer.url("/").url();
 
-    SSLContext context = SslContextBuilder.localhost();
-    server.useHttps(context.getSocketFactory(), false);
+    SslClient contextBuilder = SslClient.localhost();
+    server.useHttps(contextBuilder.socketFactory, false);
     factory.setClient(factory.client().newBuilder()
-        .sslSocketFactory(context.getSocketFactory())
+        .sslSocketFactory(contextBuilder.socketFactory, contextBuilder.trustManager)
         .followSslRedirects(true)
         .build());
     factory.setUrlFilter(new URLFilter() {
@@ -208,9 +209,53 @@ public class OkUrlFactoryTest {
       HttpsURLConnection httpsConnection = (HttpsURLConnection) factory.open(destination);
       httpsConnection.getInputStream();
       fail("Connection was successful");
-    } catch (IOException e) {
-      assertEquals("Blocked", e.getMessage());
+    } catch (IOException expected) {
     }
+  }
+
+  @Test public void usesValidHeaderValueForDefaultUserAgent() throws Exception {
+    String userAgent =  "🍩 " + "\u001F" + ('\u001f' + 1) + ('\u007f' - 1)+ '\u007f' + " 🍩";
+    String expected = "? ?" + ('\u001f' + 1) + ('\u007f' - 1) + "? ?";
+
+    System.setProperty("http.agent", userAgent);
+    server.enqueue(new MockResponse().setResponseCode(200));
+    InputStream inputStream = factory.open(server.url("/").url()).getInputStream();
+    long skipped;
+    do {
+      skipped = inputStream.skip(Long.MAX_VALUE);
+    } while (skipped != 0);
+    RecordedRequest recordedRequest = server.takeRequest();
+    assertEquals(expected, recordedRequest.getHeader("User-Agent"));
+  }
+
+  @Test public void usesSimpleDefaultUserAgentWithoutModification() throws Exception {
+    String userAgent = "OkHttp";
+    String expected = "OkHttp";
+
+    System.setProperty("http.agent", userAgent);
+    server.enqueue(new MockResponse().setResponseCode(200));
+    InputStream inputStream = factory.open(server.url("/").url()).getInputStream();
+    long skipped;
+    do {
+      skipped = inputStream.skip(Long.MAX_VALUE);
+    } while (skipped != 0);
+    RecordedRequest recordedRequest = server.takeRequest();
+    assertEquals(expected, recordedRequest.getHeader("User-Agent"));
+  }
+
+  @Test public void handlesBadUnicodeStringsInDefaultUserAgent() throws Exception {
+    String userAgent =  "🔊".substring(0, 1);
+    String expected = "?";
+
+    System.setProperty("http.agent", userAgent);
+    server.enqueue(new MockResponse().setResponseCode(200));
+    InputStream inputStream = factory.open(server.url("/").url()).getInputStream();
+    long skipped;
+    do {
+      skipped = inputStream.skip(Long.MAX_VALUE);
+    } while (skipped != 0);
+    RecordedRequest recordedRequest = server.takeRequest();
+    assertEquals(expected, recordedRequest.getHeader("User-Agent"));
   }
 
   private void assertResponseBody(HttpURLConnection connection, String expected) throws Exception {
@@ -221,7 +266,7 @@ public class OkUrlFactoryTest {
   }
 
   private void assertResponseHeader(HttpURLConnection connection, String expected) {
-    assertEquals(expected, connection.getHeaderField(OkHeaders.RESPONSE_SOURCE));
+    assertEquals(expected, connection.getHeaderField(OkHttpURLConnection.RESPONSE_SOURCE));
   }
 
   private void assertResponseCode(HttpURLConnection connection, int expected) throws IOException {

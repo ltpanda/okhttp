@@ -17,15 +17,12 @@
 package okhttp3;
 
 import java.nio.charset.Charset;
-import java.nio.charset.IllegalCharsetNameException;
-import java.nio.charset.UnsupportedCharsetException;
 import okhttp3.internal.Util;
 import org.junit.Test;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
-import static org.junit.Assert.fail;
 
 /**
  * Test MediaType API and parsing.
@@ -87,6 +84,16 @@ public class MediaTypeTest {
     assertInvalid("text/plain ; a=1");
   }
 
+  @Test public void testDoubleQuotesAreSpecial() throws Exception {
+    MediaType mediaType = MediaType.parse("text/plain;a=\";charset=utf-8;b=\"");
+    assertNull(mediaType.charset());
+  }
+
+  @Test public void testSingleQuotesAreNotSpecial() throws Exception {
+    MediaType mediaType = MediaType.parse("text/plain;a=';charset=utf-8;b='");
+    assertEquals("UTF-8", mediaType.charset().name());
+  }
+
   @Test public void testParseWithSpecialCharacters() throws Exception {
     MediaType mediaType = MediaType.parse(
         "!#$%&'*+-.{|}~/!#$%&'*+-.{|}~; !#$%&'*+-.{|}~=!#$%&'*+-.{|}~");
@@ -113,29 +120,36 @@ public class MediaTypeTest {
   }
 
   @Test public void testMultipleCharsets() {
-    try {
-      MediaType.parse("text/plain; charset=utf-8; charset=utf-16");
-      fail();
-    } catch (IllegalArgumentException expected) {
-    }
+    assertNull(MediaType.parse("text/plain; charset=utf-8; charset=utf-16"));
   }
 
   @Test public void testIllegalCharsetName() {
     MediaType mediaType = MediaType.parse("text/plain; charset=\"!@#$%^&*()\"");
-    try {
-      mediaType.charset();
-      fail();
-    } catch (IllegalCharsetNameException expected) {
-    }
+    assertNull(mediaType.charset());
   }
 
   @Test public void testUnsupportedCharset() {
     MediaType mediaType = MediaType.parse("text/plain; charset=utf-wtf");
-    try {
-      mediaType.charset();
-      fail();
-    } catch (UnsupportedCharsetException expected) {
-    }
+    assertNull(mediaType.charset());
+  }
+
+  /**
+   * This is invalid according to RFC 822. But it's what Chrome does and it avoids a potentially
+   * unpleasant IllegalCharsetNameException.
+   */
+  @Test public void testCharsetNameIsSingleQuoted() throws Exception {
+    MediaType mediaType = MediaType.parse("text/plain;charset='utf-8'");
+    assertEquals("UTF-8", mediaType.charset().name());
+  }
+
+  @Test public void testCharsetNameIsDoubleQuotedAndSingleQuoted() throws Exception {
+    MediaType mediaType = MediaType.parse("text/plain;charset=\"'utf-8'\"");
+    assertNull(mediaType.charset());
+  }
+
+  @Test public void testCharsetNameIsDoubleQuotedSingleQuote() throws Exception {
+    MediaType mediaType = MediaType.parse("text/plain;charset=\"'\"");
+    assertNull(mediaType.charset());
   }
 
   @Test public void testDefaultCharset() throws Exception {
@@ -152,7 +166,7 @@ public class MediaTypeTest {
     MediaType mediaType = MediaType.parse("text/plain;");
     assertEquals("text", mediaType.type());
     assertEquals("plain", mediaType.subtype());
-    assertEquals(null, mediaType.charset());
+    assertNull(mediaType.charset());
     assertEquals("text/plain;", mediaType.toString());
   }
 

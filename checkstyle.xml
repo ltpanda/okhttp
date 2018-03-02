@@ -1,9 +1,10 @@
 <?xml version="1.0"?>
 <!DOCTYPE module PUBLIC
-    "-//Puppy Crawl//DTD Check Configuration 1.2//EN"
-    "http://www.puppycrawl.com/dtds/configuration_1_2.dtd">
+    "-//Puppy Crawl//DTD Check Configuration 1.3//EN"
+    "http://www.puppycrawl.com/dtds/configuration_1_3.dtd">
 
 <module name="Checker">
+  <module name="SuppressWarningsFilter"/>
   <module name="NewlineAtEndOfFile"/>
   <module name="FileLength"/>
   <module name="FileTabCharacter"/>
@@ -120,7 +121,7 @@
     <!--module name="InnerAssignment"/-->
     <!--module name="MagicNumber"/-->
     <!--module name="MissingSwitchDefault"/-->
-    <module name="RedundantThrows"/>
+    <!--<module name="RedundantThrows"/>-->
     <module name="SimplifyBooleanExpression"/>
     <module name="SimplifyBooleanReturn"/>
 
@@ -139,5 +140,8 @@
     <!--module name="FinalParameters"/-->
     <!--module name="TodoComment"/-->
     <module name="UpperEll"/>
+
+    <!-- Make the @SuppressWarnings annotations available to Checkstyle -->
+    <module name="SuppressWarningsHolder"/>
   </module>
 </module>
